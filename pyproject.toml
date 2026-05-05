@@ -24,6 +24,7 @@ dependencies = [
     "matplotlib>=3.10.8,<4",
     "astropy>=7.2.0,<8",
     "asdf-astropy>=0.11.0,<0.12",
+    "grismagic @ git+https://github.com/ivastar/grismagic",
 ]
 dynamic = ['version']
 
