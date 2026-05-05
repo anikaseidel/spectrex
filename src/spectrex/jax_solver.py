@@ -117,9 +117,51 @@ class JAXProximalSolver:
     lam : float
         Group-L1 regularisation strength λ. Default 1e-2.
     max_iter : int
-        Number of FISTA iterations. Default 200.
+        Maximum number of FISTA iterations. Default 200.
     lipschitz_n_iter : int
         Power iteration steps for step-size estimation. Default 30.
+    tol : float
+        Relative convergence tolerance.  Stops early when
+        ``‖a_new − a‖ / (‖a‖ + 1e-10) < tol``.  Set to ``0.0``
+        (default) to always run ``max_iter`` iterations.
+    restart : bool
+        Enable gradient-based adaptive restart (O'Donoghue & Candès
+        2015).  When the inner product ``⟨∇f(y_k),  x_k − x_{k-1}⟩``
+        is positive — indicating momentum overshoot — the momentum
+        coefficient is reset to zero and iteration resumes from the
+        current point.  Default ``True``.
+    callback : callable, optional
+        If provided, called at the end of every iteration as
+        ``callback(iter, x, weighted_residual)`` where *iter* is
+        1-indexed, *x* is the current coefficient array (do not
+        mutate), and *weighted_residual* is ``‖W(Hx − f)‖``.
+        Adds one extra ``apply()`` call per iteration when set.
+        Default ``None``.
+
+    Notes
+    -----
+    **Why gradient restart, not monotone FISTA or backtracking?**
+    Gradient restart costs one dot product per iteration (O(K*M)).
+    Monotone FISTA (MFISTA) requires an extra ``apply()`` call every
+    time the objective increases; backtracking requires 1–3 extra
+    calls per step.  For NIRISS WFSS data, ``H^T W² H`` is
+    ill-conditioned (bright and faint sources coexist; overlapping
+    traces; precision weights spanning orders of magnitude).  In this
+    regime vanilla FISTA momentum overshoots the minimiser.  Restart
+    directly addresses this failure mode at negligible cost.
+
+    **Why fixed step 1/L, not backtracking?**
+    ``power_iteration`` with 30 steps gives an accurate Lipschitz
+    estimate for JAX operators.  Backtracking is only warranted when
+    the estimate is unreliable; increase ``lipschitz_n_iter`` for
+    atypical operators if needed.
+
+    **Why are FISTA data residuals higher than LSQR?**
+    LSQR minimises ``‖W(Hx − f)‖²`` without regularisation.  FISTA
+    minimises the same term *plus* ``λ Σ_k ‖a_k‖₂``.  A non-zero λ
+    moves the solution away from the least-squares minimum — that is
+    the point (source deblending via group sparsity).  The relevant
+    quality metric is spectrum RMSE, not data residual.
     """
 
     def __init__(
@@ -129,12 +171,18 @@ class JAXProximalSolver:
         lam: float = 1e-2,
         max_iter: int = 200,
         lipschitz_n_iter: int = 30,
+        tol: float = 0.0,
+        restart: bool = True,
+        callback=None,
     ) -> None:
         self._operator = operator
         self._noise_model = noise_model
         self._lam = lam
         self._max_iter = max_iter
         self._lipschitz_n_iter = lipschitz_n_iter
+        self._tol = tol
+        self._restart = restart
+        self._callback = callback
         self._step: float | None = None  # computed lazily on first solve
 
     def _get_step(self, w: np.ndarray) -> float:
@@ -168,7 +216,8 @@ class JAXProximalSolver:
         Returns
         -------
         np.ndarray
-            Coefficient vector ``a``, shape ``(n_coefficients,)``.
+            Coefficient vector ``a``, shape ``(n_coefficients,)``,
+            dtype ``float32``.
         """
         f = np.asarray(dispersed, dtype=np.float64).ravel()
         n_pix = f.size
@@ -193,22 +242,44 @@ class JAXProximalSolver:
         y = a.copy()
         t = 1.0
 
-        for _ in range(self._max_iter):
+        for i in range(self._max_iter):
             # Gradient of (1/2)||W(Hy − f)||²: H^T W^2 (Hy − f)
-            residual = w * (self._operator.apply(y).astype(np.float64) - f)
-            grad = self._operator.apply_adjoint(w * residual).astype(np.float64)
+            residual_w = w * (self._operator.apply(y).astype(np.float64) - f)
+            grad = self._operator.apply_adjoint(w * residual_w).astype(np.float64)
 
-            # Gradient + proximal step
+            # Proximal gradient step
             v = y - step * grad
             a_new = group_soft_threshold(
                 v.astype(np.float32), threshold=step * self._lam, K=K, M=M
             ).astype(np.float64)
 
-            # FISTA momentum
-            t_new = (1.0 + np.sqrt(1.0 + 4.0 * t ** 2)) / 2.0
-            y = a_new + ((t - 1.0) / t_new) * (a_new - a)
+            # Gradient restart (O'Donoghue & Candès 2015).
+            # At this point `a` is x_{k-1} (not yet updated).
+            if self._restart and float(np.dot(grad, a_new - a)) > 0.0:
+                t = 1.0
+                y = a_new  # discard momentum; restart from current point
+            else:
+                # Standard FISTA momentum update
+                t_new = (1.0 + np.sqrt(1.0 + 4.0 * t ** 2)) / 2.0
+                y = a_new + ((t - 1.0) / t_new) * (a_new - a)
+                t = t_new
+
+            # Optional per-iteration callback — one extra apply() when set
+            if self._callback is not None:
+                wr = float(np.linalg.norm(
+                    w * (self._operator.apply(a_new).astype(np.float64) - f)
+                ))
+                self._callback(i + 1, a_new, wr)
+
+            # Relative convergence check
+            if self._tol > 0.0:
+                delta = float(np.linalg.norm(a_new - a))
+                base = float(np.linalg.norm(a)) + 1e-10
+                if delta / base < self._tol:
+                    a = a_new
+                    break
+
             a = a_new
-            t = t_new
 
         logger.debug(
             "FISTA done: %d iters, final ||W(Ha−f)||=%.3e",
