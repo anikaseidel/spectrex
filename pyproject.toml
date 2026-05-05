@@ -143,6 +143,7 @@ testpaths = ["unittests"]
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
+    "ty>=0.0.34",
 ]
 docs = [
     "pybtex>=0.26.1",
