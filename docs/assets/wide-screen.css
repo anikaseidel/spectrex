@@ -1,0 +1,47 @@
+/* Make the content area wider for large screens (huge thanks @agoose77) */
+@media (min-width: 1536px) {
+    [class*="article-grid"] {
+        /* Widen the interior region by adding new equi-width columns */
+        grid-template-columns:
+            [screen-start]
+            0.5rem
+            [screen-inset-start]
+            1fr
+            [page-start]
+            3rem
+            [page-inset-start]
+            minmax(4rem, 9rem)
+            [body-outset-start]
+            3rem
+            /* beginning of content window */
+            [body-start gutter-left-start]
+            1rem
+            [body-inset-start]
+            minmax(5ch, 20ch)
+            [middle-start]
+            minmax(5ch, 20ch)
+            [gutter-left-end]
+            minmax(5ch, 20ch) minmax(5ch, 20ch) minmax(5ch, 20ch) minmax(
+                5ch,
+                20ch
+            )
+            [gutter-right-start]
+            minmax(5ch, 20ch)
+            [middle-end]
+            minmax(5ch, 20ch)
+            [body-inset-end]
+            1rem
+            [body-end gutter-right-end]
+            /* end of content window */
+            3rem
+            [body-outset-end]
+            minmax(5rem, 13rem)
+            [page-inset-end]
+            3rem
+            [page-end]
+            1fr
+            [screen-inset-end]
+            0.5rem
+            [screen-end] !important;
+    }
+}
