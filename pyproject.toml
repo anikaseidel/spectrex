@@ -136,7 +136,14 @@ unfixable = []
 [tool.ruff.lint.pydocstyle]
 convention = "numpy"
 
+[tool.pytest.ini_options]
+markers = ["slow: marks tests as slow (deselect with '-m not slow')"]
+testpaths = ["unittests"]
+
 [dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
 docs = [
     "pybtex>=0.26.1",
 ]
