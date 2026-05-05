@@ -13,6 +13,8 @@ wheels/
 *.py[oc]
 .venv/
 uv.lock
+docs/_build/
+legacy/
 
 # Agent working state (not project deliverables)
 .agents-workspace/
@@ -35,3 +37,4 @@ AGENTS.md
 # Test outputs
 test_*py
 test_*sh
+legacy/
