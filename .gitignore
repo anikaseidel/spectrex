@@ -35,6 +35,7 @@ AGENTS.md
 # Cache
 .ruff_cache
 notebooks/operator_cache.npz
+notebooks/analysis_operator_cache.npz
 
 # Test output scripts at repo root (not unittests/ directory)
 /test_*.py
