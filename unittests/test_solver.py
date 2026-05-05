@@ -151,13 +151,13 @@ def test_solve_regularised_with_noise_model(rectangular_operator):
 
 
 def test_sample_shape_and_type():
-    """sample() returns an array with the same shape as input."""
+    """sample() preserves shape and dtype of the input array."""
     nm = NoiseModel(read_noise=5.0)
     rng = np.random.default_rng(0)
-    image = np.ones((10, 20)) * 100.0
+    image = np.ones((10, 20), dtype=np.float32) * 100.0
     noisy = nm.sample(image, rng)
     assert noisy.shape == image.shape
-    assert noisy.dtype == np.float64
+    assert noisy.dtype == image.dtype  # float32 in → float32 out
 
 
 def test_sample_adds_noise():

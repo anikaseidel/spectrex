@@ -97,7 +97,7 @@ class NoiseModel:
             Noisy pixel values with the same shape and dtype as *f*.
         """
         sigma = np.sqrt(self.variance(f))
-        return f + rng.normal(0.0, sigma).astype(f.dtype)
+        return (f + rng.normal(0.0, sigma)).astype(f.dtype)
 
 
 class SpectralSolver:
