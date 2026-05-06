@@ -3,12 +3,6 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
----
-
-## [Unreleased]
-
----
-
 ## [0.2.2] — 2026-05-06
 
 ### Added
@@ -27,14 +21,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     over source density.
   - `comparison_computational.ipynb`: memory, runtime, and convergence benchmarks.
 
-### Fixed
-- `instrument_primer` §4: replaced shared `vmax` (dominated by Order B) with
-  per-panel auto-scaling so Order A's dispersed streak is visible alongside Order B's
-  concentrated spot.
-- `instrument_primer` §2: negative trace offsets rendered as `+-216`; corrected to
-  `−216` using `f"{val:+.0f}"` formatting.
-
----
 
 ## [0.2.0] — 2026-05-05
 
@@ -54,8 +40,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   logging).
 - Slow integration test (`@pytest.mark.slow`) for the full JAX pipeline with real
   testdata.
-
----
 
 ## [0.1.0] — 2026-05-05
 
