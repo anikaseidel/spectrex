@@ -15,6 +15,7 @@ wheels/
 uv.lock
 docs/_build/
 legacy/
+**/.ipynb_checkpoints/
 
 # Agent working state (not project deliverables)
 .agents-workspace/

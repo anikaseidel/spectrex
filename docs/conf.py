@@ -56,6 +56,8 @@ extensions = [
     "matplotlib.sphinxext.plot_directive",
     # Math support
     "sphinx.ext.mathjax",
+    # Render inline graphviz/dot diagrams
+    "sphinx.ext.graphviz",
     # UI extras
     "sphinx_copybutton",
     "sphinx_design",
