@@ -165,11 +165,11 @@ independently.
 
 The original motivation for regularisation in spectrex is that *a small number
 of PCA basis components should suffice to represent any stellar spectrum*.  That
-assumption is about sparsity *within* each source's coefficient vector — it maps
+assumption is about sparsity *within* each source's coefficient vector, which maps
 to the **lasso** penalty :math:`\sum_k \|\mathbf{a}_k\|_1`, not the group lasso.
 
 The group lasso is the correct prior when many *catalog positions are expected to
-be empty* (source-level sparsity) — the relevant scenario for blind or
+be empty* (source-level sparsity), i.e the relevant scenario for blind or
 weakly-constrained source detection.
 
 The current :class:`~spectrex.JAXProximalSolver` implements the group lasso,
