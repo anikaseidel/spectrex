@@ -24,6 +24,12 @@ A fast grism spectral extraction code optimized for crowded regions.
 
 .. toctree::
    :maxdepth: 1
+   :caption: Background
+
+   Instrument primer <content/instrument_primer>
+
+.. toctree::
+   :maxdepth: 1
    :caption: Examples
 
    Mock example <content/mock_example>
