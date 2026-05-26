@@ -138,10 +138,13 @@ class SpectralSolver:
         self,
         dispersed: np.ndarray,
         support_mask: np.ndarray | None = None,
+        M: np.ndarray | None = None,
     ) -> np.ndarray:
         """LSQR solve for source coefficients.
 
-        Minimises ``||H a - f||²``.
+         Solves:
+        1) ||H a - f||²                if M is None
+        2) ||H M x_src - f||²         if M is given
 
         Parameters
         ----------
@@ -151,16 +154,65 @@ class SpectralSolver:
             Boolean array, shape ``(n_coefficients,)``. When provided,
             the solve is restricted to ``True`` columns; the returned
             vector has zeros elsewhere.
+        M : np.ndarray, optional
+            Mixing matrix mapping source space → coefficient space.
 
         Returns
         -------
         np.ndarray
-            Coefficient vector ``a_tilde``, shape ``(n_coefficients,)``.
+        - if M is None: full coefficient vector a
+        - if M is given: M @ x_src=d
         """
         f = dispersed.ravel().astype(float)
         n_pix = f.size
         n_coef = self._operator.n_coefficients
+        n = int(n_coef/n_pix)
 
+        # ─────────────────────────────────────────────────────────────
+        # CASE 1: SOURCE-MIXED PROBLEM  ||H M x - f||
+        # ─────────────────────────────────────────────────────────────
+        if M is not None:
+            print("M shape:", M.shape)
+            print("n_pix:", n_pix)
+            print("n basis:", n)
+            print("operator shape:", self._operator._H.shape)
+            print("support_mask sum:", support_mask.sum())
+            print("Number of non zeros:", np.count_nonzero(M))
+            
+            n_srcn = M.shape[1]  # = n_src*n
+            
+
+            def _matvec(v: np.ndarray) -> np.ndarray:
+                # v = x_src
+                x_full = M @ v                 # (n_pix*n,)
+                return self._operator.apply(x_full)  # H (Mx)
+
+            def _rmatvec(v: np.ndarray) -> np.ndarray:
+                # v is in detector space
+                h_adj = self._operator.apply_adjoint(v)  # H^T v
+                return M.T @ h_adj                       # M^T H^T v
+
+            A = _make_linear_op(
+                shape=(n_pix, n_srcn),
+                matvec=_matvec,
+                rmatvec=_rmatvec,
+            )
+
+            res = lsqr(
+                A,
+                f,
+                iter_lim=self._max_iter,
+                atol=self._tolerance,
+                btol=self._tolerance,
+            )
+
+            x_src = res[0]
+
+            logger.debug("solve (HM): itn=%d r1norm=%.3e", res[2], res[3])
+            return M@x_src
+        # ─────────────────────────────────────────────────────────────
+        # CASE 2: STANDARD COEFFICIENT PROBLEM  ||H a - f||
+        # ─────────────────────────────────────────────────────────────
         if support_mask is not None:
             active_idx = np.where(support_mask)[0]
             n_active = len(active_idx)
@@ -186,26 +238,32 @@ class SpectralSolver:
             )
             d = np.zeros(n_coef)
             d[active_idx] = res[0]
-        else:
+            logger.debug("solve (support): itn=%d r1norm=%.3e", res[2], res[3])
+            return d
+        
+        # ─────────────────────────────────────────────────────────────
+        # CASE 3: FULL PROBLEM  ||H a - f||
+        # ─────────────────────────────────────────────────────────────
+        
 
-            def _matvec2(v: np.ndarray) -> np.ndarray:
-                return self._operator.apply(v)
+        def _matvec2(v: np.ndarray) -> np.ndarray:
+            return self._operator.apply(v)
 
-            def _rmatvec2(v: np.ndarray) -> np.ndarray:
-                return self._operator.apply_adjoint(v)
+        def _rmatvec2(v: np.ndarray) -> np.ndarray:
+            return self._operator.apply_adjoint(v)
 
-            A = _make_linear_op(
-                shape=(n_pix, n_coef),
-                matvec=_matvec2,
-                rmatvec=_rmatvec2,
-            )
-            res = lsqr(
-                A, f,
-                iter_lim=self._max_iter,
-                atol=self._tolerance,
-                btol=self._tolerance,
-            )
-            d = res[0]
+        A = _make_linear_op(
+            shape=(n_pix, n_coef),
+            matvec=_matvec2,
+            rmatvec=_rmatvec2,
+        )
+        res = lsqr(
+            A, f,
+            iter_lim=self._max_iter,
+            atol=self._tolerance,
+            btol=self._tolerance,
+        )
+        d = res[0]
 
         logger.debug("solve: itn=%d r1norm=%.3e", res[2], res[3])
         return d

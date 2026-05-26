@@ -1,0 +1,12 @@
+[workspace]
+authors = ["Anika Seidel <79158148+anikaseidel@users.noreply.github.com>"]
+channels = ["conda-forge"]
+name = "spectrex"
+platforms = ["win-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+photutils = ">=3.0.0,<4"
+pip = ">=26.1.1,<27"
