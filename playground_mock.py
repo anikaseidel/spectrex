@@ -63,10 +63,12 @@ else:
     print(f"Operator built in {elapsed:.1f} s — cached to {OPERATOR_CACHE}")
     print(f"Shape: {op._H.shape[0]} × {op._H.shape[1]}")
 
+# Helper
 def _clip(arr, nsigma_lo=2, nsigma_hi=2):
     m, s = np.nanmean(arr), np.nanstd(arr)
     return m - nsigma_lo * s, m + nsigma_hi * s   
 
+# With new M construction
 def run_mock_scene_optimized_recovery(
     SOURCE_DENSITY,
     op,
@@ -313,7 +315,9 @@ def run_mock_scene_optimized_recovery(
             ax.set_title(title)
             ax.set_xlabel("column")
             ax.set_ylabel("row")
+            #ax.set_aspect('equal', adjustable='box')  # scaled axes
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            
 
         fig.suptitle("Noiseless recovery — 500 × 20 stamp, GR150R/F150W", y=1.01)
         fig.tight_layout()
@@ -373,6 +377,7 @@ def run_mock_scene_optimized_recovery(
         "all_rec_vals": all_rec_vals,
     }
     
+# old version with matrix pruning
 def run_mock_scene_recovery(
     SOURCE_DENSITY,
     op,
@@ -602,8 +607,9 @@ def run_mock_scene_recovery(
             ax.set_title(title)
             ax.set_xlabel("column")
             ax.set_ylabel("row")
+            #ax.set_aspect('equal', adjustable='box')  # scaled axes
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
+       
         fig.suptitle("Noiseless recovery — 500 × 20 stamp, GR150R/F150W", y=1.01)
         fig.tight_layout()
         plt.show()
@@ -661,7 +667,10 @@ def run_mock_scene_recovery(
         "all_true_vals": all_true_vals,
         "all_rec_vals": all_rec_vals,
     }
-    
+ 
+ 
+ 
+# Loop over several densities   
 def run_densities(
     MAX_DENSITY,
     STEPS,
@@ -740,7 +749,7 @@ SEED = 50
 rng = np.random.default_rng(SEED)
 
 run_mock_scene_optimized_recovery(
-                SOURCE_DENSITY=0.03,
+                SOURCE_DENSITY=0.1,
                 op=op,
                 basis=basis,
                 IMAGE_SHAPE=IMAGE_SHAPE,
@@ -753,7 +762,7 @@ SEED = 50
 rng = np.random.default_rng(SEED)
 
 run_mock_scene_recovery(
-                SOURCE_DENSITY=0.03,
+                SOURCE_DENSITY=0.1,
                 op=op,
                 basis=basis,
                 IMAGE_SHAPE=IMAGE_SHAPE,

@@ -290,8 +290,8 @@ def run_real_image_pipeline(
     direct_raw    = load_fits_image(direct_path)
     dispersed_raw = load_fits_image(dispersed_path)
     # ── Clip to a smaller region for testing ─────────────────────────
-    direct_raw    = direct_raw   [0:500, 0:100]
-    dispersed_raw = dispersed_raw[0:500, 0:100]
+    direct_raw    = direct_raw   [0:400, 0:50]
+    dispersed_raw = dispersed_raw[0:400, 0:50]
     # ─── NaNs ──────────────────────────────────────────────────────────────
 
     kernel = Gaussian2DKernel(x_stddev=1)
@@ -503,8 +503,8 @@ def run_real_image_pipeline(
     
 
 result = run_real_image_pipeline(
-    direct_path=r"C:\Users\anika\GitHub\spectrex\testdata\RateFiles\Match\jw01090001001_27101_00004_nis_rate.fits",
-    dispersed_path=r"C:\Users\anika\GitHub\spectrex\testdata\RateFiles\Match\jw01090001001_28101_00001_nis_rate.fits",
+    direct_path=r"C:\Users\anika\GitHub\spectrex\testdata\RateFiles\Match\jw01090001001_28101_00001_nis_rate.fits",
+    dispersed_path=r"C:\Users\anika\GitHub\spectrex\testdata\RateFiles\Match\jw01090001001_27101_00004_nis_rate.fits",
     plots=True,
     parity=True,
 )
