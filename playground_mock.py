@@ -2,6 +2,8 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.sparse import coo_matrix
+from matplotlib.patches import Rectangle
 
 import spectrex
 from spectrex import (
@@ -19,7 +21,9 @@ OPERATOR_CACHE = Path("operator_cache.npz")
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 COLD_START = False    # set True to force operator rebuild from scratch
-IMAGE_SHAPE = (500, 20)
+IMAGE_SHAPE = (500, 20) # Main frame
+DETECTOR_SHAPE = (900,40) # Extended frame
+SOURCE_ORIGIN = (200,10) # (0,0) of Detector starts at (10,200)
 SOURCE_DENSITY = 0.05  # fraction of pixels with injected sources
 SEED = 50
 N_COMPONENTS = 10     # must match eigenspectra CSV
@@ -57,7 +61,7 @@ if OPERATOR_CACHE.exists() and not COLD_START:
           f"(shape {op._H.shape[0]} × {op._H.shape[1]})")
 else:
     t0 = time.perf_counter()
-    op = SciPySparseOperator.build(config, basis, IMAGE_SHAPE)
+    op = SciPySparseOperator.build_extended(config, basis, IMAGE_SHAPE,DETECTOR_SHAPE,SOURCE_ORIGIN)
     op.save(OPERATOR_CACHE)
     elapsed = time.perf_counter() - t0
     print(f"Operator built in {elapsed:.1f} s — cached to {OPERATOR_CACHE}")
@@ -74,6 +78,7 @@ def run_mock_scene_optimized_recovery(
     op,
     basis,
     IMAGE_SHAPE,
+    DETECTOR_SHAPE,
     rng,
     solver_kwargs=None,
     PARITY=None,
@@ -105,21 +110,23 @@ def run_mock_scene_optimized_recovery(
     if solver_kwargs is None:
         solver_kwargs = dict(max_iter=500, tolerance=1e-8)
 
-    H, W = IMAGE_SHAPE
-    n_pix = H * W
+    H, W = DETECTOR_SHAPE
+    K,L = IMAGE_SHAPE
+    n_pix_src = K*L
+    n_pix_det = H * W
     n = basis.n_components
 
-    a_tilde = np.zeros(n_pix * n)
+    a_tilde = np.zeros(n_pix_det * n)
 
-    num_active = int(SOURCE_DENSITY * n_pix)
-    active_k = rng.choice(n_pix, size=num_active, replace=False)
+    num_active = int(SOURCE_DENSITY * n_pix_det)
+    active_k = rng.choice(n_pix_det, size=num_active, replace=False)
 
     # -------------------------------------------------------------------------
     # Source creation
     # -------------------------------------------------------------------------
 
     sources = {}
-    pixel_to_source = -np.ones(n_pix, dtype=int)
+    pixel_to_source = -np.ones(n_pix_det, dtype=int)
 
     source_id = 0
 
@@ -186,7 +193,7 @@ def run_mock_scene_optimized_recovery(
     # Images
     # -------------------------------------------------------------------------
 
-    direct = basis.broadband_image(a_tilde, IMAGE_SHAPE)
+    direct = basis.broadband_image(a_tilde, DETECTOR_SHAPE)
 
     dispersed = op.apply(a_tilde).reshape(IMAGE_SHAPE)
 
@@ -195,20 +202,32 @@ def run_mock_scene_optimized_recovery(
     # -------------------------------------------------------------------------
 
     n_src = len(sources)
+    rows = []
+    cols = []
+    data = []
 
-    M = np.zeros((n_pix * n, n_src * n))
+    #M = np.zeros((n_pix_det * n, n_src * n))
 
     for source_id, s in sources.items():
 
         amplitudes = s["amplitudes"]
         pixels = s["pixels"]
 
-        for i, kk in enumerate(pixels):
+        for amp, kk in zip(amplitudes, pixels):
 
             for c in range(n):
 
-                M[kk * n + c, source_id * n + c] = amplitudes[i]
+                rows.append(kk * n + c)
+                cols.append(source_id * n + c)
+                data.append(amp)
 
+    M = coo_matrix(
+        (data, (rows, cols)),
+        shape=(n_pix_det * n, n_src * n)
+    )
+
+    # Often convert to CSR for efficient arithmetic
+    M = M.tocsr()
     # -------------------------------------------------------------------------
     # Recovery
     # -------------------------------------------------------------------------
@@ -242,8 +261,24 @@ def run_mock_scene_optimized_recovery(
 
     
     if PARITY == True:
-        active_indices = [k for k in range(n_pix) if np.any(a_tilde[k * n : (k + 1) * n] != 0)]
+        # only sources in main frame are evaluated!
+        active_indices = []
 
+        for k in range(n_pix_det):
+
+            if not np.any(a_tilde[k * n:(k + 1) * n] != 0):
+                continue
+
+            row = k // W
+            col = k % W
+
+            if (
+                SOURCE_ORIGIN[1] <= col < SOURCE_ORIGIN[1] + IMAGE_SHAPE[1]
+                and
+                SOURCE_ORIGIN[0] <= row < SOURCE_ORIGIN[0] + IMAGE_SHAPE[0]
+            ):
+                active_indices.append(k)
+                
         true_flux = np.concatenate(
             [basis.reconstruct(a_tilde[k * n : (k + 1) * n]) for k in active_indices]
         )
@@ -282,7 +317,7 @@ def run_mock_scene_optimized_recovery(
 
         plt.show()
     if PLOTS == True:
-        active_indices = [k for k in range(n_pix) if np.any(a_tilde[k * n : (k + 1) * n] != 0)]
+        active_indices = [k for k in range(n_pix_det) if np.any(a_tilde[k * n : (k + 1) * n] != 0)]
 
         true_flux = np.concatenate(
             [basis.reconstruct(a_tilde[k * n : (k + 1) * n]) for k in active_indices]
@@ -295,7 +330,7 @@ def run_mock_scene_optimized_recovery(
         print(f"Noiseless RMSE (flux): {rmse_noiseless:.6f}")
 
 
-        recovered_img = basis.broadband_image(recovered, IMAGE_SHAPE)
+        recovered_img = basis.broadband_image(recovered, DETECTOR_SHAPE)
         residual_img  = np.abs(direct - recovered_img)
 
         vmin_dr, vmax_dr = _clip(direct)                       # shared scale for Direct & Recovered
@@ -316,6 +351,30 @@ def run_mock_scene_optimized_recovery(
             ax.set_xlabel("column")
             ax.set_ylabel("row")
             #ax.set_aspect('equal', adjustable='box')  # scaled axes
+            if title == "Direct image" or title == "Recovered" or title == "|Residual|":
+                # Darken everything that is not detector region
+                alpha = np.full(im.get_array().shape, 0.6)
+                alpha[SOURCE_ORIGIN[0]:(IMAGE_SHAPE[0]+SOURCE_ORIGIN[0]), SOURCE_ORIGIN[1]:(IMAGE_SHAPE[1]+SOURCE_ORIGIN[1])] = 0.0
+
+                ax.imshow(
+                    np.zeros_like(im.get_array()),
+                    cmap="gray",
+                    alpha=alpha,
+                    aspect="auto",
+                    origin=im.origin if hasattr(im, "origin") else None,
+                )
+                # Red rectangle around the ROI
+                ax.add_patch(
+                    Rectangle(
+                        (SOURCE_ORIGIN[1], SOURCE_ORIGIN[0]),      # (x_min, y_min)
+                        IMAGE_SHAPE[1],             # width  = 30 - 10
+                        IMAGE_SHAPE[0],            # height = 700 - 200
+                        fill=False,
+                        edgecolor="red",
+                        linewidth=1,
+                    )
+                )
+            
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
             
 
@@ -323,7 +382,7 @@ def run_mock_scene_optimized_recovery(
         fig.tight_layout()
         plt.show()
     
-    recovered_img = basis.broadband_image(recovered, IMAGE_SHAPE)
+    recovered_img = basis.broadband_image(recovered, DETECTOR_SHAPE)
     residual_img  = np.abs(direct - recovered_img)
     
     all_true_vals = []
@@ -341,9 +400,9 @@ def run_mock_scene_optimized_recovery(
             row = i // x_pixel
             col = i % x_pixel
 
-            if col > 3:
+            if col >= SOURCE_ORIGIN[1] and col <(IMAGE_SHAPE[1]+SOURCE_ORIGIN[1]):
 
-                if row > 233 and row <400:
+                if row >= SOURCE_ORIGIN[0] and row <(IMAGE_SHAPE[0]+SOURCE_ORIGIN[0]):
 
                     count += 1
 
@@ -358,7 +417,7 @@ def run_mock_scene_optimized_recovery(
                     all_true_vals.append(spectrum_og)
                     all_rec_vals.append(spectrum)
 
-    pixel_dens = np.sum(direct[233:400, 3:] != 0)/ ((W - 3) * (400-233))
+    pixel_dens = np.sum(direct[SOURCE_ORIGIN[0]:(IMAGE_SHAPE[0]+SOURCE_ORIGIN[0]), SOURCE_ORIGIN[1]:(IMAGE_SHAPE[1]+SOURCE_ORIGIN[1])] != 0)/ (((IMAGE_SHAPE[1]+SOURCE_ORIGIN[1]) - SOURCE_ORIGIN[1]) * ((IMAGE_SHAPE[0]+SOURCE_ORIGIN[0])-SOURCE_ORIGIN[0]))
     average = norm / count if count > 0 else 0
 
     print("Pixel density of recoverable sources:", pixel_dens)
@@ -749,55 +808,56 @@ SEED = 50
 rng = np.random.default_rng(SEED)
 
 run_mock_scene_optimized_recovery(
-                SOURCE_DENSITY=0.1,
+                SOURCE_DENSITY=0.01,
                 op=op,
                 basis=basis,
                 IMAGE_SHAPE=IMAGE_SHAPE,
+                DETECTOR_SHAPE=DETECTOR_SHAPE,
                 rng=rng,
                 PARITY=True,
                 PLOTS=True,
             )
 
-SEED = 50
-rng = np.random.default_rng(SEED)
+# SEED = 50
+# rng = np.random.default_rng(SEED)
 
-run_mock_scene_recovery(
-                SOURCE_DENSITY=0.1,
-                op=op,
-                basis=basis,
-                IMAGE_SHAPE=IMAGE_SHAPE,
-                rng=rng,
-                PARITY=True,
-                PLOTS=True,
-            )
+# run_mock_scene_recovery(
+#                 SOURCE_DENSITY=0.1,
+#                 op=op,
+#                 basis=basis,
+#                 IMAGE_SHAPE=IMAGE_SHAPE,
+#                 rng=rng,
+#                 PARITY=True,
+#                 PLOTS=True,
+#             )
 
 ############# density plot example
-fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+# fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-run_densities(
-    MAX_DENSITY=0.05,
-    STEPS=3,
-    op=op,
-    basis=basis,
-    IMAGE_SHAPE=IMAGE_SHAPE,
-    rng=rng,
-    OPTIMIZED= True,
-    ax1= axes[0],
-)
+# run_densities(
+#     MAX_DENSITY=0.05,
+#     STEPS=3,
+#     op=op,
+#     basis=basis,
+#     IMAGE_SHAPE=IMAGE_SHAPE,
+#     rng=rng,
+#     OPTIMIZED= True,
+#     ax1= axes[0],
+# )
 
 
-run_densities(
-    MAX_DENSITY=0.05,
-    STEPS=3,
-    op=op,
-    basis=basis,
-    IMAGE_SHAPE=IMAGE_SHAPE,
-    rng=rng,
-    OPTIMIZED= False,
-    ax1 = axes[1],
-)
-axes[0].set_title("Optimized with Mixing Operator")
-axes[1].set_title("Non-optimized")
+# run_densities(
+#     MAX_DENSITY=0.05,
+#     STEPS=3,
+#     op=op,
+#     basis=basis,
+#     IMAGE_SHAPE=IMAGE_SHAPE,
+#     rng=rng,
+#     OPTIMIZED= False,
+#     ax1 = axes[1],
+# )
+# axes[0].set_title("Optimized with Mixing Operator")
+# axes[1].set_title("Non-optimized")
 
-plt.tight_layout()
-plt.show()
+# plt.tight_layout()
+# plt.show()

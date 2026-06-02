@@ -166,7 +166,7 @@ class SpectralSolver:
         f = dispersed.ravel().astype(float)
         n_pix = f.size
         n_coef = self._operator.n_coefficients
-        n = int(n_coef/n_pix)
+
 
         # ─────────────────────────────────────────────────────────────
         # CASE 1: SOURCE-MIXED PROBLEM  ||H M x - f||
@@ -174,10 +174,9 @@ class SpectralSolver:
         if M is not None:
             print("M shape:", M.shape)
             print("n_pix:", n_pix)
-            print("n basis:", n)
             print("operator shape:", self._operator._H.shape)
             print("support_mask sum:", support_mask.sum())
-            print("Number of non zeros:", np.count_nonzero(M))
+            #print("Number of non zeros:", np.count_nonzero(M))
             
             n_srcn = M.shape[1]  # = n_src*n
             
