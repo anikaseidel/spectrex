@@ -20,10 +20,11 @@ TESTDATA = HERE/"testdata"
 OPERATOR_CACHE = Path("operator_cache.npz")
 
 # ── Configuration ─────────────────────────────────────────────────────────────
+# set cold_start true if anything in this configuration section is changed or delete operator chache
 COLD_START = False    # set True to force operator rebuild from scratch
-IMAGE_SHAPE = (500, 20) # Main frame
-DETECTOR_SHAPE = (900,40) # Extended frame
-SOURCE_ORIGIN = (200,10) # (0,0) of Detector starts at (10,200)
+IMAGE_SHAPE = (2048, 2048) # Main frame
+DETECTOR_SHAPE = (2500,2100) # Extended frame
+SOURCE_ORIGIN = (250,25) # (0,0) of Detector starts at (10,200)
 SOURCE_DENSITY = 0.05  # fraction of pixels with injected sources
 SEED = 50
 N_COMPONENTS = 10     # must match eigenspectra CSV
