@@ -99,7 +99,13 @@ class InstrumentConfig:
 
         grism = Path(conf_path).stem.split(".")[0]
         orders = list(trace.orders)
-
+        orders_AB = []
+        for i in orders:
+            if i =="A" or i==1:
+                orders_AB.append(i)
+            if i =="B" or i==0:
+                orders_AB.append(i)
+        orders = orders_AB #only includes A, B orders
         sensitivity: dict[str, np.ndarray] = {}
         for order_letter in orders:
             order_int = _ORDER_LETTER_TO_INT.get(order_letter)

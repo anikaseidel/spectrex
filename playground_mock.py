@@ -18,13 +18,14 @@ from spectrex import (
 HERE = Path(__file__).resolve().parent
 TESTDATA = HERE/"testdata"
 OPERATOR_CACHE = Path("operator_cache.npz")
+IMAGES = HERE / "unittests" / "Images"
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 # set cold_start true if anything in this configuration section is changed or delete operator chache
 COLD_START = False    # set True to force operator rebuild from scratch
-IMAGE_SHAPE = (2048, 2048) # Main frame
-DETECTOR_SHAPE = (2500,2100) # Extended frame
-SOURCE_ORIGIN = (250,25) # (0,0) of Detector starts at (10,200)
+IMAGE_SHAPE = (500, 20) # Main frame
+DETECTOR_SHAPE = (1000,40) # Extended frame
+SOURCE_ORIGIN = (250,10) # (0,0) of Detector starts at (10,200)
 SOURCE_DENSITY = 0.05  # fraction of pixels with injected sources
 SEED = 50
 N_COMPONENTS = 10     # must match eigenspectra CSV
@@ -240,11 +241,13 @@ def run_mock_scene_optimized_recovery(
     active_blocks = blocks.any(axis=1)
 
     num_active_blocks = active_blocks.sum()
+    pd = (num_active_blocks / (H * W)) * 100 # pixel density
+    sd = (len(sources) / (H * W)) * 100 # source density
 
     print(f"Dispersed image range: [{dispersed.min():.4f}, {dispersed.max():.4f}]")
     print(f"Active coefficients: {support_mask.sum()} / {len(support_mask)}")
-    print(f"Pixel density: {(num_active_blocks / (H * W)) * 100:.4f}%")
-    print(f"Source density: {(len(sources) / (H * W)) * 100:.4f}%")
+    print(f"Pixel density: {pd:.4f}%")
+    print(f"Source density: {sd:.4f}%")
 
     solver = SpectralSolver(op, **solver_kwargs)
 
@@ -280,13 +283,16 @@ def run_mock_scene_optimized_recovery(
             ):
                 active_indices.append(k)
                 
-        true_flux = np.concatenate(
-            [basis.reconstruct(a_tilde[k * n : (k + 1) * n]) for k in active_indices]
-        )
-        rec_flux = np.concatenate(
-            [basis.reconstruct(recovered[k * n : (k + 1) * n]) for k in active_indices]
-        )
-
+        if active_indices:
+            true_flux = np.concatenate(
+                [basis.reconstruct(a_tilde[k * n : (k + 1) * n]) for k in active_indices]
+            )
+            rec_flux = np.concatenate(
+                [basis.reconstruct(recovered[k * n : (k + 1) * n]) for k in active_indices]
+            )
+        else:
+            true_flux = np.array([])
+            rec_flux = np.array([])
 
         fig, axes = plt.subplots(2, 1, figsize=(5, 8), sharex=True, tight_layout=True, height_ratios=(1, 0.6), gridspec_kw={'hspace': 0})
         ax = axes[0]
@@ -294,14 +300,26 @@ def run_mock_scene_optimized_recovery(
 
         ax.scatter(true_flux[~outliers], rec_flux[~outliers], s=2, alpha=0.05, linewidths=0, color="C0", rasterized=True)
         ax.scatter(true_flux[outliers], rec_flux[outliers], s=2, alpha=0.05, linewidths=0, color="C1", rasterized=True)
-        minv = max(min(true_flux.min(), rec_flux.min()), -10_000)
-        maxv = max(true_flux.max(), rec_flux.max())
+        
+        if true_flux.size > 0 and rec_flux.size > 0:
+            minv = max(min(true_flux.min(), rec_flux.min()), 0)
+        else:
+            minv = 0  
+            
+        if true_flux.size > 0 and rec_flux.size > 0:
+            maxv = max(true_flux.max(), rec_flux.max())
+        else:
+            maxv = 10_000  
+        
         ax.plot([minv, maxv], [minv, maxv], "r--", lw=1, label="1:1")
         ax.set_aspect("equal", adjustable="box")
         ax.set_xlim(minv, maxv)
         ax.set_ylim(minv, maxv)
         ax.set_ylabel("Recovered flux  f(λ)")
-        ax.set_title("Parity plot — noiseless")
+        ax.set_title(
+            f"Parity plot — noiseless\n"
+            f"sd={sd:.4f}%, pd={pd:.4f}%\n"
+        )
 
         ax = axes[1]
         frac_residuals = (true_flux - rec_flux) / true_flux
@@ -315,8 +333,14 @@ def run_mock_scene_optimized_recovery(
                 bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8))
         fig.tight_layout()
 
-
-        plt.show()
+        filename = IMAGES / (
+                    f"sd{sd:.4f}".replace('.', 'p') +
+                    f"_pd{pd:.4f}".replace('.', 'p') +
+                    "_noiseless_GR150R_F150W_parity_plot.png"
+        )
+        plt.savefig(filename)
+        plt.close()
+        
     if PLOTS == True:
         active_indices = [k for k in range(n_pix_det) if np.any(a_tilde[k * n : (k + 1) * n] != 0)]
 
@@ -333,20 +357,22 @@ def run_mock_scene_optimized_recovery(
 
         recovered_img = basis.broadband_image(recovered, DETECTOR_SHAPE)
         residual_img  = np.abs(direct - recovered_img)
-
+        print(dispersed.shape, recovered.shape, recovered_img.shape)
+        residual_dispersion = np.abs(dispersed-op.apply(recovered).reshape(IMAGE_SHAPE))
+        
         vmin_dr, vmax_dr = _clip(direct)                       # shared scale for Direct & Recovered
         vmin_d2, vmax_d2 = _clip(dispersed)
-        vmax_res = np.nanmean(residual_img) + np.nanstd(residual_img)
+        vmax_res = np.max(residual_dispersion)
 
-        fig, axes = plt.subplots(1, 4, figsize=(14, 4))
+        fig, axes = plt.subplots(1, 4, figsize=(14, 4),constrained_layout=True)
         kw = dict(origin="lower", aspect="auto", interpolation="nearest", cmap="inferno")
 
         im0 = axes[0].imshow(direct,        vmin=vmin_dr, vmax=vmax_dr, **kw)
         im1 = axes[1].imshow(dispersed,     vmin=vmin_d2, vmax=vmax_d2, **kw)
         im2 = axes[2].imshow(recovered_img, vmin=vmin_dr, vmax=vmax_dr, **kw)
-        im3 = axes[3].imshow(residual_img,  vmin=0,       vmax=vmax_res, **kw)
+        im3 = axes[3].imshow(residual_dispersion,  vmin=0,       vmax=vmax_res, **kw)
 
-        titles = ["Direct image", "Dispersed (grism)", "Recovered", "|Residual|"]
+        titles = ["Direct image", "Dispersed (grism)", "Recovered", "|Residual_dispersion|"]
         for ax, im, title in zip(axes, [im0, im1, im2, im3], titles):
             ax.set_title(title)
             ax.set_xlabel("column")
@@ -376,13 +402,20 @@ def run_mock_scene_optimized_recovery(
                     )
                 )
             
-            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            fig.colorbar(im, ax=ax)
             
 
-        fig.suptitle("Noiseless recovery — 500 × 20 stamp, GR150R/F150W", y=1.01)
-        fig.tight_layout()
-        plt.show()
+        fig.suptitle(f"Noiseless recovery — 500 × 20 stamp, GR150R/F150W, sd = {sd:.4f}%, pd = {pd:.4f}%")
+        #fig.tight_layout()
     
+        filename = IMAGES / (
+            f"sd{sd:.4f}".replace('.', 'p') +
+            f"_pd{pd:.4f}".replace('.', 'p') +
+            "_noiseless_GR150R_F150W.png"
+        )
+        plt.savefig(filename)
+        plt.close()
+        
     recovered_img = basis.broadband_image(recovered, DETECTOR_SHAPE)
     residual_img  = np.abs(direct - recovered_img)
     
@@ -435,7 +468,7 @@ def run_mock_scene_optimized_recovery(
         "residual_img": residual_img,
         "all_true_vals": all_true_vals,
         "all_rec_vals": all_rec_vals,
-    }
+    } 
     
 # old version with matrix pruning
 def run_mock_scene_recovery(
@@ -728,7 +761,400 @@ def run_mock_scene_recovery(
         "all_rec_vals": all_rec_vals,
     }
  
- 
+def single_source_run_mock_scene_optimized_recovery(
+    POSITION,
+    op,
+    basis,
+    IMAGE_SHAPE,
+    DETECTOR_SHAPE,
+    rng,
+    solver_kwargs=None,
+    PARITY=None,
+    PLOTS=None,
+    MAX_TRIES=50,
+    SIGMA_MEAN=0.5,
+    SIGMA_STD=0.25,
+    RADIUS_FACTOR=2,
+):
+    """
+    Create a single source mock scene at the center of the image, recover it, and compute reconstruction metrics.
+
+    Returns
+    -------
+    result : dict
+        Contains:
+            - density
+            - mse
+            - recovered
+            - a_tilde
+            - direct
+            - dispersed
+            - recovered_img
+            - residual_img
+            - all_true_vals
+            - all_rec_vals
+    """
+
+    if solver_kwargs is None:
+        solver_kwargs = dict(max_iter=500, tolerance=1e-8)
+
+    H, W = DETECTOR_SHAPE
+    K,L = IMAGE_SHAPE
+    n_pix_src = K*L
+    n_pix_det = H * W
+    n = basis.n_components
+
+    a_tilde = np.zeros(n_pix_det * n)
+
+    # Desired source location
+    x0 = POSITION[0]
+    y0 = POSITION[1]
+    
+    # -------------------------------------------------------------------------
+    # Source creation
+    # -------------------------------------------------------------------------
+
+    sources = {}
+    pixel_to_source = -np.ones(n_pix_det, dtype=int)
+
+    source_id = 0
+
+    for _ in range(MAX_TRIES):
+
+        flux = rng.uniform(-1, 1, size=n)
+
+        # require positive reconstructed spectrum
+        if not np.all(basis.reconstruct(flux) >= 0):
+            continue
+
+        sigma = max(0.5, rng.normal(SIGMA_MEAN, SIGMA_STD))
+        r = int(np.ceil(RADIUS_FACTOR * sigma))
+
+        y_min = max(0, y0 - r)
+        y_max = min(H, y0 + r + 1)
+
+        x_min = max(0, x0 - r)
+        x_max = min(W, x0 + r + 1)
+
+        ys = np.arange(y_min, y_max)
+        xs = np.arange(x_min, x_max)
+
+        YY, XX = np.meshgrid(ys, xs, indexing="ij")
+
+        gauss = np.exp(
+            -((XX - x0) ** 2 + (YY - y0) ** 2) / (2 * sigma**2)
+        )
+
+        gauss /= gauss.max()
+
+        pixels = []
+        amplitudes = []
+
+        for yy, xx, amp in zip(YY.ravel(), XX.ravel(), gauss.ravel()):
+
+            kk = yy * W + xx
+
+            pixels.append(kk)
+            amplitudes.append(amp)
+
+            pixel_to_source[kk] = source_id
+
+            a_tilde[kk * n : (kk + 1) * n] += amp * flux
+
+        sources[source_id] = {
+            "center": (y0, x0),
+            "flux": flux,
+            "amplitudes": np.array(amplitudes),
+            "sigma": sigma,
+            "pixels": np.array(pixels, dtype=int),
+        }
+
+        source_id += 1
+        break
+
+    print(f"Sources placed: {len(sources)}")
+
+    # -------------------------------------------------------------------------
+    # Images
+    # -------------------------------------------------------------------------
+
+    direct = basis.broadband_image(a_tilde, DETECTOR_SHAPE)
+
+    dispersed = op.apply(a_tilde).reshape(IMAGE_SHAPE)
+
+    # -------------------------------------------------------------------------
+    # Mixing matrix
+    # -------------------------------------------------------------------------
+
+    n_src = len(sources)
+    rows = []
+    cols = []
+    data = []
+
+    #M = np.zeros((n_pix_det * n, n_src * n))
+
+    for source_id, s in sources.items():
+
+        amplitudes = s["amplitudes"]
+        pixels = s["pixels"]
+
+        for amp, kk in zip(amplitudes, pixels):
+
+            for c in range(n):
+
+                rows.append(kk * n + c)
+                cols.append(source_id * n + c)
+                data.append(amp)
+
+    M = coo_matrix(
+        (data, (rows, cols)),
+        shape=(n_pix_det * n, n_src * n)
+    )
+
+    # Often convert to CSR for efficient arithmetic
+    M = M.tocsr()
+    # -------------------------------------------------------------------------
+    # Recovery
+    # -------------------------------------------------------------------------
+
+    support_mask = a_tilde != 0
+
+    blocks = support_mask.reshape(-1, n)
+
+    active_blocks = blocks.any(axis=1)
+
+    num_active_blocks = active_blocks.sum()
+    pd = (num_active_blocks / (H * W)) * 100 # pixel density
+    sd = (len(sources) / (H * W)) * 100 # source density
+
+    print(f"Dispersed image range: [{dispersed.min():.4f}, {dispersed.max():.4f}]")
+    print(f"Active coefficients: {support_mask.sum()} / {len(support_mask)}")
+    print(f"Pixel density: {pd:.4f}%")
+    print(f"Source density: {sd:.4f}%")
+
+    solver = SpectralSolver(op, **solver_kwargs)
+
+    recovered = solver.solve(
+        dispersed,
+        support_mask=support_mask,
+        M=M,
+    )
+
+    print(f"Recovered vector shape: {recovered.shape}")
+
+    # -------------------------------------------------------------------------
+    # Evaluation
+    # -------------------------------------------------------------------------
+
+    
+    if PARITY == True:
+        # only sources in main frame are evaluated!
+        active_indices = []
+
+        for k in range(n_pix_det):
+
+            if not np.any(a_tilde[k * n:(k + 1) * n] != 0):
+                continue
+
+            row = k // W
+            col = k % W
+
+            if (
+                SOURCE_ORIGIN[1] <= col < SOURCE_ORIGIN[1] + IMAGE_SHAPE[1]
+                and
+                SOURCE_ORIGIN[0] <= row < SOURCE_ORIGIN[0] + IMAGE_SHAPE[0]
+            ):
+                active_indices.append(k)
+                
+        if active_indices:
+            true_flux = np.concatenate(
+                [basis.reconstruct(a_tilde[k * n : (k + 1) * n]) for k in active_indices]
+            )
+            rec_flux = np.concatenate(
+                [basis.reconstruct(recovered[k * n : (k + 1) * n]) for k in active_indices]
+            )
+        else:
+            true_flux = np.array([])
+            rec_flux = np.array([])
+
+        fig, axes = plt.subplots(2, 1, figsize=(5, 8), sharex=True, tight_layout=True, height_ratios=(1, 0.6), gridspec_kw={'hspace': 0})
+        ax = axes[0]
+        outliers = rec_flux <= 1.
+
+        ax.scatter(true_flux[~outliers], rec_flux[~outliers], s=2, alpha=0.05, linewidths=0, color="C0", rasterized=True)
+        ax.scatter(true_flux[outliers], rec_flux[outliers], s=2, alpha=0.05, linewidths=0, color="C1", rasterized=True)
+        
+        if true_flux.size > 0 and rec_flux.size > 0:
+            minv = max(min(true_flux.min(), rec_flux.min()), -10_000)
+        else:
+            minv = -10_000  # or whatever sensible default you want
+            
+        if true_flux.size > 0 and rec_flux.size > 0:
+            maxv = max(true_flux.max(), rec_flux.max())
+        else:
+            maxv = 10_000  # or whatever sensible default you want
+        
+        ax.plot([minv, maxv], [minv, maxv], "r--", lw=1, label="1:1")
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlim(minv, maxv)
+        ax.set_ylim(minv, maxv)
+        ax.set_ylabel("Recovered flux  f(λ)")
+        ax.set_title(
+            f"Parity plot — noiseless\n"
+            f"sd={sd:.4f}%, pd={pd:.4f}%\n"
+            f"source position (x0,y0)={POSITION}"
+        )
+
+        ax = axes[1]
+        frac_residuals = (true_flux - rec_flux) / true_flux
+        ax.scatter(true_flux[~outliers], frac_residuals[~outliers], s=2, alpha=0.05, linewidths=0, color="C0", rasterized=True)
+        ax.scatter(true_flux[outliers], frac_residuals[outliers], s=2, alpha=0.05, linewidths=0, color="C1", rasterized=True)
+        ax.set_ylim(-2, 2)
+        ax.set_xlabel("True flux  f(λ)")
+        rmse_noiseless_good = np.sqrt(np.mean(frac_residuals[~outliers]) ** 2)
+        ax.text(0.05, 0.92, f"frac. mean error = {rmse_noiseless_good:.4f}", color='C0',
+                transform=ax.transAxes, fontsize=10,
+                bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8))
+        fig.tight_layout()
+
+        filename = IMAGES / (
+                    f"source_x{POSITION[0]}_y{POSITION[1]}"
+                    f"_sd{str(sd).replace('.', 'p')}"
+                    f"_pd{str(pd).replace('.', 'p')}"
+                    "_noiseless_GR150R_F150W_parity_plot.png"
+        )
+        plt.savefig(filename)
+        plt.close()
+        
+    if PLOTS == True:
+        active_indices = [k for k in range(n_pix_det) if np.any(a_tilde[k * n : (k + 1) * n] != 0)]
+
+        true_flux = np.concatenate(
+            [basis.reconstruct(a_tilde[k * n : (k + 1) * n]) for k in active_indices]
+        )
+        rec_flux = np.concatenate(
+            [basis.reconstruct(recovered[k * n : (k + 1) * n]) for k in active_indices]
+        )
+
+        rmse_noiseless = np.sqrt(np.mean((true_flux - rec_flux) ** 2))
+        print(f"Noiseless RMSE (flux): {rmse_noiseless:.6f}")
+
+
+        recovered_img = basis.broadband_image(recovered, DETECTOR_SHAPE)
+        residual_img  = np.abs(direct - recovered_img)
+        print(dispersed.shape, recovered.shape, recovered_img.shape)
+        residual_dispersion = np.abs(dispersed-op.apply(recovered).reshape(IMAGE_SHAPE))
+        
+        vmin_dr, vmax_dr = _clip(direct)                       # shared scale for Direct & Recovered
+        vmin_d2, vmax_d2 = _clip(dispersed)
+        vmax_res = np.max(residual_dispersion)
+
+        fig, axes = plt.subplots(1, 4, figsize=(14, 4),constrained_layout=True)
+        kw = dict(origin="lower", aspect="auto", interpolation="nearest", cmap="inferno")
+
+        im0 = axes[0].imshow(direct,        vmin=vmin_dr, vmax=vmax_dr, **kw)
+        im1 = axes[1].imshow(dispersed,     vmin=vmin_d2, vmax=vmax_d2, **kw)
+        im2 = axes[2].imshow(recovered_img, vmin=vmin_dr, vmax=vmax_dr, **kw)
+        im3 = axes[3].imshow(residual_dispersion,  vmin=0,       vmax=vmax_res, **kw)
+
+        titles = ["Direct image", "Dispersed (grism)", "Recovered", "|Residual_dispersion|"]
+        for ax, im, title in zip(axes, [im0, im1, im2, im3], titles):
+            ax.set_title(title)
+            ax.set_xlabel("column")
+            ax.set_ylabel("row")
+            #ax.set_aspect('equal', adjustable='box')  # scaled axes
+            if title == "Direct image" or title == "Recovered" or title == "|Residual|":
+                # Darken everything that is not detector region
+                alpha = np.full(im.get_array().shape, 0.6)
+                alpha[SOURCE_ORIGIN[0]:(IMAGE_SHAPE[0]+SOURCE_ORIGIN[0]), SOURCE_ORIGIN[1]:(IMAGE_SHAPE[1]+SOURCE_ORIGIN[1])] = 0.0
+
+                ax.imshow(
+                    np.zeros_like(im.get_array()),
+                    cmap="gray",
+                    alpha=alpha,
+                    aspect="auto",
+                    origin=im.origin if hasattr(im, "origin") else None,
+                )
+                # Red rectangle around the ROI
+                ax.add_patch(
+                    Rectangle(
+                        (SOURCE_ORIGIN[1], SOURCE_ORIGIN[0]),      # (x_min, y_min)
+                        IMAGE_SHAPE[1],             # width  = 30 - 10
+                        IMAGE_SHAPE[0],            # height = 700 - 200
+                        fill=False,
+                        edgecolor="red",
+                        linewidth=1,
+                    )
+                )
+            
+            fig.colorbar(im, ax=ax)
+            
+
+        fig.suptitle(f"Noiseless recovery — 500 × 20 stamp, GR150R/F150W, sd = {sd:.4f}%, pd = {pd:.4f}%, source position (x0,y0) = {POSITION}")
+        #fig.tight_layout()
+    
+        filename = IMAGES / (
+            f"source_x{POSITION[0]}_y{POSITION[1]}"
+            f"_sd{str(sd).replace('.', 'p')}"
+            f"_pd{str(pd).replace('.', 'p')}"
+            "_noiseless_GR150R_F150W.png"
+        )
+        plt.savefig(filename)
+        plt.close()
+        
+    recovered_img = basis.broadband_image(recovered, DETECTOR_SHAPE)
+    residual_img  = np.abs(direct - recovered_img)
+    
+    all_true_vals = []
+    all_rec_vals = []
+
+    count = 0
+    norm = 0
+
+    x_pixel = W
+
+    for i in range(int(len(a_tilde) / n)):
+
+        if np.any(a_tilde[i * n : (i + 1) * n] != 0):
+
+            row = i // x_pixel
+            col = i % x_pixel
+
+            if col >= SOURCE_ORIGIN[1] and col <(IMAGE_SHAPE[1]+SOURCE_ORIGIN[1]):
+
+                if row >= SOURCE_ORIGIN[0] and row <(IMAGE_SHAPE[0]+SOURCE_ORIGIN[0]):
+
+                    count += 1
+
+                    spectrum = basis.reconstruct(recovered[i * n : (i + 1) * n])
+                    spectrum_og = basis.reconstruct(a_tilde[i * n : (i + 1) * n])
+
+                    norm += (
+                        np.linalg.norm(spectrum - spectrum_og)
+                        / (np.linalg.norm(spectrum_og) + 1e-8)
+                    )
+
+                    all_true_vals.append(spectrum_og)
+                    all_rec_vals.append(spectrum)
+
+    pixel_dens = np.sum(direct[SOURCE_ORIGIN[0]:(IMAGE_SHAPE[0]+SOURCE_ORIGIN[0]), SOURCE_ORIGIN[1]:(IMAGE_SHAPE[1]+SOURCE_ORIGIN[1])] != 0)/ (((IMAGE_SHAPE[1]+SOURCE_ORIGIN[1]) - SOURCE_ORIGIN[1]) * ((IMAGE_SHAPE[0]+SOURCE_ORIGIN[0])-SOURCE_ORIGIN[0]))
+    average = norm / count if count > 0 else 0
+
+    print("Pixel density of recoverable sources:", pixel_dens)
+    print("MSE =", average)
+
+    return {
+        "pixel density": pixel_dens,
+        "mse": average,
+        "recovered": recovered,
+        "a_tilde": a_tilde,
+        "direct": direct,
+        "dispersed": dispersed,
+        "recovered_img": recovered_img,
+        "residual_img": residual_img,
+        "all_true_vals": all_true_vals,
+        "all_rec_vals": all_rec_vals,
+    } 
  
 # Loop over several densities   
 def run_densities(
@@ -805,11 +1231,11 @@ def run_densities(
 
     return fig, ax1
 ################parity plots
-SEED = 50
+SEED = 42
 rng = np.random.default_rng(SEED)
 
-run_mock_scene_optimized_recovery(
-                SOURCE_DENSITY=0.01,
+single_source_run_mock_scene_optimized_recovery(
+                POSITION= (31,250),
                 op=op,
                 basis=basis,
                 IMAGE_SHAPE=IMAGE_SHAPE,
@@ -818,7 +1244,19 @@ run_mock_scene_optimized_recovery(
                 PARITY=True,
                 PLOTS=True,
             )
+SEED = 42
+rng = np.random.default_rng(SEED)
 
+run_mock_scene_optimized_recovery(
+                SOURCE_DENSITY=0.05,
+                op=op,
+                basis=basis,
+                IMAGE_SHAPE=IMAGE_SHAPE,
+                DETECTOR_SHAPE=DETECTOR_SHAPE,
+                rng=rng,
+                PARITY=True,
+                PLOTS=True,
+            )
 # SEED = 50
 # rng = np.random.default_rng(SEED)
 
