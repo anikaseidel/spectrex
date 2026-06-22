@@ -1,31 +1,27 @@
-"""
-Real-image extension of the spectrex mock-scene pipeline.
-==========================================================
-Replaces the synthetic scene with:
-  - A real direct FITS image  → source detection + Gaussian PSF fitting
-  - A real dispersed FITS image → used as the observed grism frame
-
-The coefficient vector  a_tilde  is built from the fitted Gaussian profiles
-and eigenspectra projections, then passed to SpectralSolver exactly as in the
-mock pipeline.
-
-Usage
------
-    python spectrex_real_images.py direct.fits dispersed.fits \
-        [--detection-sigma 5] [--fit-box 15] [--parity] [--plots]
-"""
-
 from pathlib import Path
-import argparse
-import time
 
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
+from scipy.sparse import coo_matrix
+from matplotlib.patches import Rectangle
+
+import astropy.units as u
+
+from astropy.coordinates import SkyCoord
+from astropy.time import Time
+from astroquery.mast import MastMissions, Observations
+import numpy as np
+
+
 from astropy.io import fits
-from astropy.stats import sigma_clipped_stats
-from astropy.modeling import models, fitting
-from photutils.detection import DAOStarFinder
-from astropy.convolution import interpolate_replace_nans, Gaussian2DKernel
+from astropy.table import Table
+
+
+from jwst import datamodels
+from jwst.assign_wcs import AssignWcsStep
+
+import stpsf
+
 
 import spectrex
 from spectrex import (
@@ -36,12 +32,28 @@ from spectrex import (
     SpectralSolver,
 )
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-HERE       = Path(__file__).resolve().parent
-TESTDATA   = HERE / "testdata"
+# ── Paths ────────────────────────────────────────────────────────────────────
+HERE = Path(__file__).resolve().parent
+TESTDATA = HERE/"testdata"
 OPERATOR_CACHE = Path("operator_cache.npz")
+IMAGES = HERE / "unittests" / "Images"
 
-# ── Instrument / basis setup (identical to mock pipeline) ────────────────────
+# ── Configuration ─────────────────────────────────────────────────────────────
+# set cold_start true if anything in this configuration section is changed or delete operator chache
+COLD_START = False    # set True to force operator rebuild from scratch
+IMAGE_SHAPE = (500, 20) # Main frame
+DETECTOR_SHAPE = (355+500+10,26) # Extended frame
+SOURCE_ORIGIN = (180,3) # (0,0) of Detector starts at (10,200)
+SOURCE_DENSITY = 0.05  # fraction of pixels with injected sources
+SEED = 50
+N_COMPONENTS = 10     # must match eigenspectra CSV
+
+rng = np.random.default_rng(SEED)
+
+print(f"spectrex {spectrex.__version__}")
+
+# ── Instrument configuration & eigenspectra basis ───────────────────────────────────────
+
 config = InstrumentConfig.from_files(
     conf_path=TESTDATA / "Config Files" / "GR150R.F150W.220725.conf",
     wavelengthrange_path=TESTDATA / "jwst_niriss_wavelengthrange_0002.asdf",
@@ -55,456 +67,853 @@ basis = EigenspectraBasis.from_csv(
     config.wavelengths,
 )
 
-N_COMPONENTS = basis.n_components
+print(f"Wavelength range: {config.wavelengths[0]:.0f} – {config.wavelengths[-1]:.0f} Å")
+print(f"Grism orders: {list(config.orders)}")
+print(f"Basis components: {basis.n_components}")
 
+# ── Forward operator ──────────────────────────────────────────────────────
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+import time
 
+if OPERATOR_CACHE.exists() and not COLD_START:
+    op = SciPySparseOperator.load(OPERATOR_CACHE)
+    print(f"Operator loaded from {OPERATOR_CACHE}  "
+          f"(shape {op._H.shape[0]} × {op._H.shape[1]})")
+else:
+    t0 = time.perf_counter()
+    op = SciPySparseOperator.build_extended(config, basis, IMAGE_SHAPE,DETECTOR_SHAPE,SOURCE_ORIGIN)
+    op.save(OPERATOR_CACHE)
+    elapsed = time.perf_counter() - t0
+    print(f"Operator built in {elapsed:.1f} s — cached to {OPERATOR_CACHE}")
+    print(f"Shape: {op._H.shape[0]} × {op._H.shape[1]}")
+
+# Helper
 def _clip(arr, nsigma_lo=2, nsigma_hi=2):
     m, s = np.nanmean(arr), np.nanstd(arr)
-    return m - nsigma_lo * s, m + nsigma_hi * s
+    return m - nsigma_lo * s, m + nsigma_hi * s   
 
 
-def load_fits_image(path: str) -> np.ndarray:
-    """Return the first 2-D HDU as float32."""
-    with fits.open(path) as hdul:
-        for hdu in hdul:
-            if hdu.data is not None and hdu.data.ndim == 2:
-                return hdu.data.astype(np.float32)
-    raise ValueError(f"No 2-D image extension found in {path}")
 
+# -------------------------------------------------------------------------
+# STPSF sigma estimation
+# -------------------------------------------------------------------------
 
-def subtract_background(image: np.ndarray, sigma: float = 3.0):
-    """Sigma-clipped median background subtraction."""
-    _, median, _ = sigma_clipped_stats(image, sigma=sigma)
-    return image - median, median
+def estimate_sigma_from_stpsf(
+    instrument_name="NIRISS",
+    filter_name="F150W",
+    detector=None,
+    fov_pixels=64,
+    oversample=4,
+):
+    inst = getattr(stpsf, instrument_name)()
+    inst.filter = filter_name
 
+    if detector is not None:
+        inst.detector = detector
 
-# ── Contamination geometry ────────────────────────────────────────────────────
-
-def build_contamination_mask(disp_shape, direct_shape,
-                              dispersion_px_per_nm, lambda_min_nm,
-                              lambda_max_nm, lambda_ref_nm,
-                              tilt_deg=0.0, n_lambda=200):
-    """
-    True where a dispersed pixel cannot be back-projected to ANY source
-    inside the direct frame (i.e. purely from an out-of-field contaminant).
-    """
-    ny_d, nx_d   = disp_shape
-    ny_dir, nx_dir = direct_shape
-
-    lambdas  = np.linspace(lambda_min_nm, lambda_max_nm, n_lambda)
-    shifts_x = (lambdas - lambda_ref_nm) * dispersion_px_per_nm
-    shifts_y = shifts_x * np.tan(np.deg2rad(tilt_deg))
-
-    rows, cols = np.mgrid[0:ny_d, 0:nx_d]
-    src_x = cols[None] - shifts_x[:, None, None]
-    src_y = rows[None] - shifts_y[:, None, None]
-
-    any_in = np.any(
-        (src_x >= 0) & (src_x < nx_dir) &
-        (src_y >= 0) & (src_y < ny_dir),
-        axis=0,
+    psf_hdul = inst.calc_psf(
+        fov_pixels=fov_pixels,
+        oversample=oversample,
     )
-    return ~any_in   # True = contaminated
+
+    psf = np.asarray(psf_hdul[0].data, dtype=float)
+
+    psf = np.nan_to_num(psf, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if psf.sum() <= 0:
+        raise ValueError("STPSF returned an empty or invalid PSF.")
+
+    psf /= psf.sum()
+
+    ny, nx = psf.shape
+    YY, XX = np.mgrid[:ny, :nx]
+
+    x0 = np.sum(XX * psf)
+    y0 = np.sum(YY * psf)
+
+    var_x = np.sum((XX - x0) ** 2 * psf)
+    var_y = np.sum((YY - y0) ** 2 * psf)
+
+    sigma_oversampled = np.sqrt(0.5 * (var_x + var_y))
+    sigma_detector_pixels = sigma_oversampled / oversample
+
+    return sigma_detector_pixels, psf
 
 
-def filter_out_of_field_sources(detections, disp_shape, direct_shape,
-                                  dispersion_px_per_nm, lambda_min_nm,
-                                  lambda_max_nm, lambda_ref_nm, tilt_deg=0.0):
+# -------------------------------------------------------------------------
+# FITS helpers
+# -------------------------------------------------------------------------
+
+def read_fits_image(filename, ext="SCI"):
+    with fits.open(filename) as hdul:
+        if ext in hdul:
+            image = hdul[ext].data
+        else:
+            image = hdul[0].data
+
+    image = np.asarray(image, dtype=float)
+    image = np.nan_to_num(image, nan=0.0, posinf=0.0, neginf=0.0)
+
+    return image
+
+
+def get_wcs_world_to_detector(filename):
+    dm = datamodels.open(filename)
+    dm = AssignWcsStep.call(dm)
+    return dm.meta.wcs.get_transform("world", "detector")
+
+
+# -------------------------------------------------------------------------
+# Catalog reading
+# -------------------------------------------------------------------------
+
+def read_catalog_sources_world_to_detector(
+    catalog_files,
+    wcs,
+    ra_col="RA",
+    dec_col="DEC",
+):
+    xs = []
+    ys = []
+    source_catalog = []
+    source_index = []
+
+    for catalog in catalog_files:
+        tab = Table.read(catalog)
+
+        # Be permissive about column names.
+        names_lower = {name.lower(): name for name in tab.colnames}
+
+        if ra_col not in tab.colnames:
+            ra_name = names_lower.get(ra_col.lower(), None)
+        else:
+            ra_name = ra_col
+
+        if dec_col not in tab.colnames:
+            dec_name = names_lower.get(dec_col.lower(), None)
+        else:
+            dec_name = dec_col
+
+        if ra_name is None or dec_name is None:
+            raise KeyError(
+                f"Could not find RA/DEC columns in {catalog}. "
+                f"Available columns are: {tab.colnames}"
+            )
+
+        ra = np.asarray(tab[ra_name], dtype=float)
+        dec = np.asarray(tab[dec_name], dtype=float)
+
+        x_det, y_det, *_ = wcs(ra, dec, ra, dec)
+
+        for i, (x0, y0) in enumerate(zip(x_det, y_det)):
+            if not np.isfinite(x0) or not np.isfinite(y0):
+                continue
+
+            xs.append(float(x0))
+            ys.append(float(y0))
+            source_catalog.append(catalog)
+            source_index.append(i)
+
+    return np.asarray(xs), np.asarray(ys), source_catalog, source_index
+
+
+# -------------------------------------------------------------------------
+# Gaussian support construction
+# -------------------------------------------------------------------------
+
+def estimate_local_flux(
+    direct,
+    x0,
+    y0,
+    background_radius=6,
+    aperture_radius=1,
+):
     """
-    Remove detections whose zeroth-order lies outside the direct frame,
-    or whose entire trace falls outside the dispersed frame.
+    Estimate local source amplitude from the direct image.
+
+    This returns a positive local peak estimate:
+        local_flux = max(local_peak - local_background, 0)
+
+    For very crowded images, replace this by a more careful photometry
+    estimate later.
     """
-    ny_dir, nx_dir = direct_shape
-    ny_disp, nx_disp = disp_shape
+    H, W = direct.shape
 
-    lambdas  = np.linspace(lambda_min_nm, lambda_max_nm, 200)
-    shifts_x = (lambdas - lambda_ref_nm) * dispersion_px_per_nm
-    shifts_y = shifts_x * np.tan(np.deg2rad(tilt_deg))
+    xc = int(round(x0))
+    yc = int(round(y0))
 
-    kept = []
-    for (x0, y0, peak) in detections:
-        if not (0 <= x0 < nx_dir and 0 <= y0 < ny_dir):
-            continue
-        tx = x0 + shifts_x
-        ty = y0 + shifts_y
-        if np.any((tx >= 0) & (tx < nx_disp) & (ty >= 0) & (ty < ny_disp)):
-            kept.append((x0, y0, peak))
-    return kept
+    if not (0 <= xc < W and 0 <= yc < H):
+        return 0.0
 
+    r_bg = int(background_radius)
+    y_min = max(0, yc - r_bg)
+    y_max = min(H, yc + r_bg + 1)
+    x_min = max(0, xc - r_bg)
+    x_max = min(W, xc + r_bg + 1)
 
-# ── Source detection & PSF fitting ───────────────────────────────────────────
+    patch = direct[y_min:y_max, x_min:x_max]
 
-def detect_sources(image_bg, threshold_sigma=5.0, fwhm=3.0):
-    _, _, std = sigma_clipped_stats(image_bg, sigma=3.0)
-    dao = DAOStarFinder(fwhm=fwhm, threshold=threshold_sigma * std,
-                        exclude_border=True)
-    tbl = dao(image_bg)
-    if tbl is None or len(tbl) == 0:
-        return []
-    return [(float(r['x_centroid']), float(r['y_centroid']), float(r['peak']))
-            for r in tbl]
+    if patch.size == 0:
+        return 0.0
 
+    background = np.nanmedian(patch)
 
-def fit_gaussian_psf(image_bg, detections, fit_box=15):
-    """Fit a 2-D Gaussian to each detection; return list of param dicts."""
-    ny, nx = image_bg.shape
-    fitter = fitting.LevMarLSQFitter()
-    half   = fit_box // 2
-    sources = []
+    r_ap = int(aperture_radius)
+    y0_ap = max(0, yc - r_ap)
+    y1_ap = min(H, yc + r_ap + 1)
+    x0_ap = max(0, xc - r_ap)
+    x1_ap = min(W, xc + r_ap + 1)
 
-    for sid, (x0, y0, peak) in enumerate(detections):
-        ix, iy = int(round(x0)), int(round(y0))
-        x1, x2 = max(0, ix - half), min(nx, ix + half + 1)
-        y1, y2 = max(0, iy - half), min(ny, iy + half + 1)
-        stamp   = image_bg[y1:y2, x1:x2]
-        yy, xx  = np.mgrid[y1:y2, x1:x2].astype(float)
+    aperture = direct[y0_ap:y1_ap, x0_ap:x1_ap]
 
-        init = models.Gaussian2D(
-            amplitude=peak, x_mean=x0, y_mean=y0,
-            x_stddev=2.0, y_stddev=2.0, theta=0.0,
-        )
-        init.x_stddev.bounds = (0.5, half)
-        init.y_stddev.bounds = (0.5, half)
+    if aperture.size == 0:
+        return 0.0
 
-        try:
-            fit = fitter(init, xx, yy, stamp)
-            sources.append(dict(
-                id=sid,
-                x=float(fit.x_mean.value), y=float(fit.y_mean.value),
-                amplitude=float(fit.amplitude.value),
-                sigma_x=float(fit.x_stddev.value),
-                sigma_y=float(fit.y_stddev.value),
-                theta=float(fit.theta.value),
-            ))
-        except Exception:
-            sources.append(dict(
-                id=sid, x=x0, y=y0, amplitude=peak,
-                sigma_x=2.0, sigma_y=2.0, theta=0.0,
-            ))
+    peak = np.nanmax(aperture)
 
-    return sources
+    return max(float(peak - background), 0.0)
 
 
-# ── Build a_tilde from real detections ───────────────────────────────────────
+def estimate_noise_level(
+    direct,
+    method="mad",
+    fixed_noise=None,
+):
+    if fixed_noise is not None:
+        return float(fixed_noise)
 
-def _gaussian_stamp(src, image_shape, radius_factor=2):
+    data = np.asarray(direct, dtype=float)
+    data = data[np.isfinite(data)]
+
+    if data.size == 0:
+        raise ValueError("Cannot estimate noise from empty image.")
+
+    if method == "mad":
+        med = np.median(data)
+        mad = np.median(np.abs(data - med))
+        noise = 1.4826 * mad
+    elif method == "std":
+        noise = np.std(data)
+    else:
+        raise ValueError("method must be 'mad' or 'std'.")
+
+    return max(float(noise), 1e-12)
+
+
+def radius_from_flux_threshold(
+    local_flux,
+    sigma,
+    noise_level,
+    noise_factor=3.0,
+    min_radius_sigma=1.5,
+    max_radius_sigma=6.0,
+):
     """
-    Return pixel indices and Gaussian amplitudes for one source.
-    Mirrors exactly how the mock pipeline builds its Gaussian blob.
-    """
-    H, W   = image_shape
-    x0, y0 = src['x'], src['y']
-    sigma  = 0.5 * (src['sigma_x'] + src['sigma_y'])   # isotropic approximation
-    r      = int(np.ceil(radius_factor * sigma))
+    Choose radius from:
 
-    y_min, y_max = max(0, int(y0) - r), min(H, int(y0) + r + 1)
-    x_min, x_max = max(0, int(x0) - r), min(W, int(x0) + r + 1)
+        local_flux * exp(-r^2 / (2 sigma^2)) >= threshold
+
+    with threshold = noise_factor * noise_level.
+
+    Hence:
+
+        r = sigma * sqrt(2 log(local_flux / threshold))
+
+    If local_flux <= threshold, use a small fallback radius.
+    """
+    threshold = noise_factor * noise_level
+
+    min_radius = min_radius_sigma * sigma
+    max_radius = max_radius_sigma * sigma
+
+    if local_flux <= threshold or local_flux <= 0:
+        return min_radius
+
+    radius = sigma * np.sqrt(2.0 * np.log(local_flux / threshold))
+
+    return float(np.clip(radius, min_radius, max_radius))
+
+
+def gaussian_source_pixels_from_direct_image(
+    direct,
+    x0,
+    y0,
+    sigma,
+    noise_level,
+    noise_factor=3.0,
+    min_radius_sigma=1.5,
+    max_radius_sigma=6.0,
+    background_radius=6,
+    aperture_radius=1,
+):
+    H, W = direct.shape
+
+    local_flux = estimate_local_flux(
+        direct,
+        x0=x0,
+        y0=y0,
+        background_radius=background_radius,
+        aperture_radius=aperture_radius,
+    )
+
+    radius = radius_from_flux_threshold(
+        local_flux=local_flux,
+        sigma=sigma,
+        noise_level=noise_level,
+        noise_factor=noise_factor,
+        min_radius_sigma=min_radius_sigma,
+        max_radius_sigma=max_radius_sigma,
+    )
+
+    r = int(np.ceil(radius))
+
+    x_min = max(0, int(np.floor(x0)) - r)
+    x_max = min(W, int(np.floor(x0)) + r + 1)
+
+    y_min = max(0, int(np.floor(y0)) - r)
+    y_max = min(H, int(np.floor(y0)) + r + 1)
 
     YY, XX = np.mgrid[y_min:y_max, x_min:x_max]
-    gauss  = np.exp(-((XX - x0) ** 2 + (YY - y0) ** 2) / (2 * sigma ** 2))
-    gauss /= gauss.max()
 
-    pixels     = (YY.ravel() * W + XX.ravel()).astype(int)
-    amplitudes = gauss.ravel()
-    return pixels, amplitudes
+    gauss = np.exp(
+        -((XX - x0) ** 2 + (YY - y0) ** 2) / (2.0 * sigma**2)
+    )
 
+    # Peak normalization: centroid/peak has value one.
+    if gauss.size > 0 and gauss.max() > 0:
+        gauss /= gauss.max()
 
-def build_a_tilde_from_sources(sources, direct_bg, image_shape,
-                                basis, radius_factor=2):
-    H, W   = image_shape
-    n      = basis.n_components
-    n_pix  = H * W
-    a_tilde = np.zeros(n_pix * n, dtype=np.float64)
+    # Keep pixels inside the radius.
+    rr = np.sqrt((XX - x0) ** 2 + (YY - y0) ** 2)
+    mask = rr <= radius
 
-    # Inspect what basis actually exposes
-    print(f"    basis attributes: {[a for a in dir(basis) if not a.startswith('_')]}")
+    pixels = (YY[mask] * W + XX[mask]).astype(int)
+    amplitudes = gauss[mask].astype(float)
 
-    for src in sources:
-        pixels, amplitudes = _gaussian_stamp(src, image_shape, radius_factor)
-
-        # Simple initialisation: unit coefficients scaled by source amplitude.
-        # First component gets the amplitude, rest are zero.
-        # This avoids needing to invert the basis entirely.
-        coeff = np.zeros(n)
-        coeff[0] = src['amplitude']
-
-        for kk, amp in zip(pixels, amplitudes):
-            if 0 <= kk < n_pix:
-                a_tilde[kk * n : (kk + 1) * n] += amp * coeff
-
-    return a_tilde
-
-# ── Mixing matrix M (same structure as mock pipeline) ────────────────────────
-
-def build_mixing_matrix(sources, image_shape, basis, radius_factor=2):
-    H, W   = image_shape
-    n      = basis.n_components
-    n_pix  = H * W
-    n_src  = len(sources)
-
-    M = np.zeros((n_pix * n, n_src * n), dtype=np.float32)
-
-    for j, src in enumerate(sources):
-        pixels, amplitudes = _gaussian_stamp(src, image_shape, radius_factor)
-        for kk, amp in zip(pixels, amplitudes):
-            if 0 <= kk < n_pix:
-                for c in range(n):
-                    M[kk * n + c, j * n + c] = amp
-
-    return M
+    return {
+        "center": (y0, x0),
+        "pixels": pixels,
+        "amplitudes": amplitudes,
+        "sigma": sigma,
+        "radius": radius,
+        "local_flux": local_flux,
+    }
 
 
-# ── Main real-image pipeline ──────────────────────────────────────────────────
+# -------------------------------------------------------------------------
+# Full real-data recovery method
+# -------------------------------------------------------------------------
 
-def run_real_image_pipeline(
-    direct_path: str,
-    dispersed_path: str,
-    *,
-    # grism geometry (tune to your instrument / filter)
-    dispersion_px_per_nm: float = 4.65,
-    lambda_min_nm: float        = 800.0,
-    lambda_max_nm: float        = 1150.0,
-    lambda_ref_nm: float        = 975.0,
-    tilt_deg: float             = 0.0,
-    # detection / fitting
-    detection_sigma: float = 5.0,
-    fit_box: int           = 15,
-    radius_factor: float   = 2.0,
-    # solver
-    max_iter: int   = 500,
-    tolerance: float = 1e-8,
-    use_mixing: bool = True,
-    # plots
-    parity: bool = False,
-    plots:  bool = False,
-    cold_start: bool = False,
+def run_real_scene_optimized_recovery(
+    direct_fits,
+    dispersed_fits,
+    catalog_files,
+    op,
+    basis,
+    wcs_reference_fits=None,
+    direct_ext="SCI",
+    dispersed_ext="SCI",
+    ra_col="RA",
+    dec_col="DEC",
+    solver_kwargs=None,
+    instrument_name="NIRISS",
+    filter_name="F150W",
+    detector=None,
+    stpsf_fov_pixels=64,
+    stpsf_oversample=4,
+    fixed_sigma=None,
+    fixed_noise=None,
+    noise_method="mad",
+    noise_factor=3.0,
+    min_radius_sigma=1.5,
+    max_radius_sigma=6.0,
+    background_radius=6,
+    aperture_radius=1,
+    PLOTS=False,
 ):
-    print("=" * 65)
-    print(f"spectrex {spectrex.__version__}  —  real-image pipeline")
-    print("=" * 65)
+    """
+    Real-data version of run_mock_scene_optimized_recovery.
 
-    # ── 1. Load & background-subtract ────────────────────────────────────────
-    print("\n[1] Loading FITS images …")
-    direct_raw    = load_fits_image(direct_path)
-    dispersed_raw = load_fits_image(dispersed_path)
-    # ── Clip to a smaller region for testing ─────────────────────────
-    direct_raw    = direct_raw   [0:400, 0:50]
-    dispersed_raw = dispersed_raw[0:400, 0:50]
-    # ─── NaNs ──────────────────────────────────────────────────────────────
+    Main differences from the mock version:
+        - direct is read from direct_fits
+        - dispersed is read from dispersed_fits
+        - source positions are read from catalog_files
+        - source supports are Gaussian supports estimated from the direct image
+        - one common sigma is estimated from STPSF unless fixed_sigma is provided
+        - radius changes from source to source via local_flux / noise_level
 
-    kernel = Gaussian2DKernel(x_stddev=1)
-    direct_raw    = interpolate_replace_nans(direct_raw,    kernel)
-    dispersed_raw = interpolate_replace_nans(dispersed_raw, kernel)
-    IMAGE_SHAPE   = direct_raw.shape
-    print(f"    Direct    : {direct_raw.shape}")
-    print(f"    Dispersed : {dispersed_raw.shape}")
+    The unknown is now source-level spectral coefficients:
 
-    direct_bg,    _ = subtract_background(direct_raw)
-    dispersed_bg, _ = subtract_background(dispersed_raw)
+        x_src.shape = (n_sources * basis.n_components,)
 
-    # ── 2. Operator (cached, same as mock) ────────────────────────────────────
-    print("\n[2] Forward operator …")
-    if OPERATOR_CACHE.exists() and not cold_start:
-        op = SciPySparseOperator.load(OPERATOR_CACHE)
-        print(f"    Loaded from cache  (shape {op._H.shape})")
-    else:
-        t0 = time.perf_counter()
-        op = SciPySparseOperator.build(config, basis, IMAGE_SHAPE)
-        op.save(OPERATOR_CACHE)
-        print(f"    Built in {time.perf_counter()-t0:.1f} s")
+    and the pixel-level coefficient image is reconstructed by:
 
-    # ── 3. Source detection in direct image ───────────────────────────────────
-    print(f"\n[3] Detecting sources (threshold = {detection_sigma}σ) …")
-    raw_detections = detect_sources(direct_bg, threshold_sigma=detection_sigma)
-    print(f"    Raw detections: {len(raw_detections)}")
+        recovered = M @ x_src
+    """
 
-    # ── 4. Remove out-of-field contaminants ───────────────────────────────────
-    print("\n[4] Filtering contaminating traces …")
-    clean_detections = filter_out_of_field_sources(
-        raw_detections,
-        disp_shape=dispersed_bg.shape,
-        direct_shape=direct_bg.shape,
-        dispersion_px_per_nm=dispersion_px_per_nm,
-        lambda_min_nm=lambda_min_nm,
-        lambda_max_nm=lambda_max_nm,
-        lambda_ref_nm=lambda_ref_nm,
-        tilt_deg=tilt_deg,
-    )
-    contamination_mask = build_contamination_mask(
-        disp_shape=dispersed_bg.shape,
-        direct_shape=direct_bg.shape,
-        dispersion_px_per_nm=dispersion_px_per_nm,
-        lambda_min_nm=lambda_min_nm,
-        lambda_max_nm=lambda_max_nm,
-        lambda_ref_nm=lambda_ref_nm,
-        tilt_deg=tilt_deg,
-    )
-    print(f"    Sources after filtering : {len(clean_detections)}")
-    print(f"    Contaminated pixels     : {contamination_mask.mean()*100:.1f}%")
+    if solver_kwargs is None:
+        solver_kwargs = dict(max_iter=500, tolerance=1e-8)
 
-    # ── 5. Gaussian PSF fitting ───────────────────────────────────────────────
-    print("\n[5] Gaussian PSF fitting …")
-    sources = fit_gaussian_psf(direct_bg, clean_detections, fit_box=fit_box)
-    for s in sources:
-        print(f"    src {s['id']:3d}  x={s['x']:7.2f}  y={s['y']:7.2f}  "
-              f"A={s['amplitude']:8.1f}  σx={s['sigma_x']:.2f}  σy={s['sigma_y']:.2f}")
+    # ---------------------------------------------------------------------
+    # Images
+    # ---------------------------------------------------------------------
 
-    # ── 6. Build a_tilde & support mask from real detections ─────────────────
-    print("\n[6] Building coefficient vector a_tilde from detections …")
-    a_tilde = build_a_tilde_from_sources(
-        sources, direct_bg, IMAGE_SHAPE, basis, radius_factor=radius_factor
-    )
-    support_mask = a_tilde != 0
-    print(f"    Active coefficients: {support_mask.sum()} / {len(support_mask)}")
+    direct = read_fits_image(direct_fits, ext=direct_ext)
+    dispersed = read_fits_image(dispersed_fits, ext=dispersed_ext)
 
-    # ── 7. Mixing matrix (optional, same as optimized mock) ───────────────────
-    M = None
-    if use_mixing:
-        print("\n[7] Building mixing matrix M …")
-        M = build_mixing_matrix(sources, IMAGE_SHAPE, basis, radius_factor=radius_factor)
-        print(f"    M shape: {M.shape}")
+    DETECTOR_SHAPE = direct.shape
+    IMAGE_SHAPE = dispersed.shape
 
-    # ── 8. Solve  H * a = dispersed ──────────────────────────────────────────
-    print("\n[8] Running SpectralSolver …")
+    H, W = DETECTOR_SHAPE
+    K, L = IMAGE_SHAPE
 
-    # Zero out contaminated pixels so they don't bias the solve
-    dispersed_clean = dispersed_bg.copy()
-    dispersed_clean[contamination_mask] = 0.0
-
-    solver    = SpectralSolver(op, max_iter=max_iter, tolerance=tolerance)
-    recovered = solver.solve(dispersed_clean, support_mask=support_mask, M=M)
-    print(f"    Recovered shape: {recovered.shape}")
-
-    # ── 9. Diagnostics ────────────────────────────────────────────────────────
-    H_px, W_px = IMAGE_SHAPE
+    n_pix_det = H * W
     n = basis.n_components
-    n_pix = H_px * W_px
 
-    recovered_img = basis.broadband_image(recovered, IMAGE_SHAPE)
-    residual_img  = np.abs(direct_bg - recovered_img)
+    print("Direct shape:", direct.shape)
+    print("Dispersed shape:", dispersed.shape)
+    print("Basis components:", n)
 
-    if plots:
-        vmin_dr, vmax_dr = _clip(direct_bg)
-        vmin_d2, vmax_d2 = _clip(dispersed_clean)
-        vmax_res = np.nanmean(residual_img) + np.nanstd(residual_img)
+    # ---------------------------------------------------------------------
+    # WCS
+    # ---------------------------------------------------------------------
 
-        fig, axes = plt.subplots(1, 4, figsize=(16, 4))
-        kw = dict(origin="lower", aspect="auto", interpolation="nearest", cmap="inferno")
-        ims = [
-            axes[0].imshow(direct_bg,       vmin=vmin_dr, vmax=vmax_dr, **kw),
-            axes[1].imshow(dispersed_clean, vmin=vmin_d2, vmax=vmax_d2, **kw),
-            axes[2].imshow(recovered_img,   vmin=vmin_dr, vmax=vmax_dr, **kw),
-            axes[3].imshow(residual_img,    vmin=0,       vmax=vmax_res, **kw),
-        ]
-        for ax, im, t in zip(axes, ims,
-                              ["Direct (bg-sub)", "Dispersed (masked)",
-                               "Recovered", "|Residual|"]):
-            ax.set_title(t); ax.set_xlabel("col"); ax.set_ylabel("row")
-            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    if wcs_reference_fits is None:
+        wcs_reference_fits = direct_fits
 
-        # Overlay detections on direct image
-        for s in sources:
-            axes[0].plot(s['x'], s['y'], 'r+', ms=8, mew=1.5)
+    wcs = get_wcs_world_to_detector(wcs_reference_fits)
 
-        fig.suptitle("Real-image recovery — spectrex", y=1.01)
-        fig.tight_layout()
-        plt.show()
-
-    if parity:
-        active_indices = [
-            k for k in range(n_pix)
-            if np.any(a_tilde[k*n:(k+1)*n] != 0)
-        ]
-        true_flux = np.concatenate(
-            [basis.reconstruct(a_tilde[k*n:(k+1)*n]) for k in active_indices]
-        )
-        rec_flux = np.concatenate(
-            [basis.reconstruct(recovered[k*n:(k+1)*n]) for k in active_indices]
-        )
-
-        fig, axes = plt.subplots(2, 1, figsize=(5, 8), sharex=True,
-                                  height_ratios=(1, 0.6),
-                                  gridspec_kw={'hspace': 0})
-        outliers = rec_flux <= 1.0
-        minv = max(min(true_flux.min(), rec_flux.min()), -10_000)
-        maxv = max(true_flux.max(), rec_flux.max())
-
-        axes[0].scatter(true_flux[~outliers], rec_flux[~outliers],
-                        s=2, alpha=0.05, linewidths=0, color="C0", rasterized=True)
-        axes[0].scatter(true_flux[outliers],  rec_flux[outliers],
-                        s=2, alpha=0.05, linewidths=0, color="C1", rasterized=True)
-        axes[0].plot([minv, maxv], [minv, maxv], "r--", lw=1)
-        axes[0].set_aspect("equal", adjustable="box")
-        axes[0].set_xlim(minv, maxv); axes[0].set_ylim(minv, maxv)
-        axes[0].set_ylabel("Recovered flux f(λ)")
-        axes[0].set_title("Parity plot — real images")
-
-        frac = (true_flux - rec_flux) / (true_flux + 1e-8)
-        axes[1].scatter(true_flux[~outliers], frac[~outliers],
-                        s=2, alpha=0.05, linewidths=0, color="C0", rasterized=True)
-        axes[1].scatter(true_flux[outliers],  frac[outliers],
-                        s=2, alpha=0.05, linewidths=0, color="C1", rasterized=True)
-        axes[1].set_ylim(-2, 2)
-        axes[1].set_xlabel("True flux f(λ)")
-        fme = np.sqrt(np.mean(frac[~outliers])**2)
-        axes[1].text(0.05, 0.92, f"frac. mean error = {fme:.4f}", color="C0",
-                     transform=axes[1].transAxes, fontsize=10,
-                     bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8))
-        fig.tight_layout()
-        plt.show()
-
-    return dict(
-        sources=sources,
-        a_tilde=a_tilde,
-        recovered=recovered,
-        direct=direct_bg,
-        dispersed=dispersed_clean,
-        recovered_img=recovered_img,
-        residual_img=residual_img,
-        contamination_mask=contamination_mask,
+    x_det, y_det, source_catalog, source_index = read_catalog_sources_world_to_detector(
+        catalog_files=catalog_files,
+        wcs=wcs,
+        ra_col=ra_col,
+        dec_col=dec_col,
     )
 
+    # ---------------------------------------------------------------------
+    # Sigma and noise
+    # ---------------------------------------------------------------------
 
-# # ── CLI ───────────────────────────────────────────────────────────────────────
-# if __name__ == "__main__":
-#     parser = argparse.ArgumentParser()
-#     parser.add_argument("direct",    help="Direct image FITS file")
-#     parser.add_argument("dispersed", help="Dispersed (grism) FITS file")
-#     parser.add_argument("--dispersion",       type=float, default=4.65)
-#     parser.add_argument("--lambda-min",       type=float, default=800.0)
-#     parser.add_argument("--lambda-max",       type=float, default=1150.0)
-#     parser.add_argument("--lambda-ref",       type=float, default=975.0)
-#     parser.add_argument("--tilt",             type=float, default=0.0)
-#     parser.add_argument("--detection-sigma",  type=float, default=5.0)
-#     parser.add_argument("--fit-box",          type=int,   default=15)
-#     parser.add_argument("--no-mixing",        action="store_true")
-#     parser.add_argument("--parity",           action="store_true")
-#     parser.add_argument("--plots",            action="store_true")
-#     parser.add_argument("--cold-start",       action="store_true")
-#     args = parser.parse_args()
+    if fixed_sigma is None:
+        sigma, psf = estimate_sigma_from_stpsf(
+            instrument_name=instrument_name,
+            filter_name=filter_name,
+            detector=detector,
+            fov_pixels=stpsf_fov_pixels,
+            oversample=stpsf_oversample,
+        )
+    else:
+        sigma = float(fixed_sigma)
+        psf = None
 
-#     run_real_image_pipeline(
-#         direct_path=args.direct,
-#         dispersed_path=args.dispersed,
-#         dispersion_px_per_nm=args.dispersion,
-#         lambda_min_nm=args.lambda_min,
-#         lambda_max_nm=args.lambda_max,
-#         lambda_ref_nm=args.lambda_ref,
-#         tilt_deg=args.tilt,
-#         detection_sigma=args.detection_sigma,
-#         fit_box=args.fit_box,
-#         use_mixing=not args.no_mixing,
-#         parity=args.parity,
-#         plots=args.plots,
-#         cold_start=args.cold_start,
-#     )
+    noise_level = estimate_noise_level(
+        direct,
+        method=noise_method,
+        fixed_noise=fixed_noise,
+    )
+
+    print(f"Estimated sigma: {sigma:.6f} detector pixels")
+    print(f"Estimated noise level: {noise_level:.6e}")
+    print(f"Threshold = noise_factor * noise_level = {noise_factor * noise_level:.6e}")
+
+    # ---------------------------------------------------------------------
+    # Source creation from real catalogs
+    # ---------------------------------------------------------------------
+
+    sources = {}
+    pixel_to_sources = {}
+
+    source_id = 0
+
+    for x0, y0, cat, idx in zip(x_det, y_det, source_catalog, source_index):
+
+        if not np.isfinite(x0) or not np.isfinite(y0):
+            continue
+
+        if not (0 <= x0 < W and 0 <= y0 < H):
+            continue
+
+        src = gaussian_source_pixels_from_direct_image(
+            direct=direct,
+            x0=x0,
+            y0=y0,
+            sigma=sigma,
+            noise_level=noise_level,
+            noise_factor=noise_factor,
+            min_radius_sigma=min_radius_sigma,
+            max_radius_sigma=max_radius_sigma,
+            background_radius=background_radius,
+            aperture_radius=aperture_radius,
+        )
+
+        if len(src["pixels"]) == 0:
+            continue
+
+        src["catalog"] = cat
+        src["catalog_index"] = idx
+
+        sources[source_id] = src
+
+        for kk in src["pixels"]:
+            pixel_to_sources.setdefault(int(kk), []).append(source_id)
+
+        source_id += 1
+
+    n_src = len(sources)
+
+    print(f"Catalog sources inside detector: {n_src}")
+
+    if n_src == 0:
+        raise ValueError("No catalog sources landed inside the detector.")
+
+    # ---------------------------------------------------------------------
+    # Mixing matrix M
+    # ---------------------------------------------------------------------
+
+    rows = []
+    cols = []
+    data = []
+
+    for source_id, s in sources.items():
+
+        amplitudes = s["amplitudes"]
+        pixels = s["pixels"]
+
+        for amp, kk in zip(amplitudes, pixels):
+
+            for c in range(n):
+
+                rows.append(kk * n + c)
+                cols.append(source_id * n + c)
+                data.append(amp)
+
+    M = coo_matrix(
+        (data, (rows, cols)),
+        shape=(n_pix_det * n, n_src * n),
+    ).tocsr()
+
+    print("[M] shape:", M.shape)
+    print("[M] nnz:", M.nnz)
+
+    active_pixel_blocks = np.zeros(n_pix_det, dtype=bool)
+
+    for s in sources.values():
+        active_pixel_blocks[s["pixels"]] = True
+
+    support_mask = np.repeat(active_pixel_blocks, n)
+
+    pixel_density = active_pixel_blocks.sum() / n_pix_det * 100.0
+    source_density = n_src / n_pix_det * 100.0
+
+    print(f"Pixel density: {pixel_density:.6f}%")
+    print(f"Source density: {source_density:.6f}%")
+
+    print(f"Dispersed image range: [{dispersed.min():.4f}, {dispersed.max():.4f}]")
+
+    # ---------------------------------------------------------------------
+    # Recovery
+    # ---------------------------------------------------------------------
+
+    solver = SpectralSolver(op, **solver_kwargs)
+
+    # With M, the solver should solve:
+    #
+    #     min_x || H M x - dispersed ||_2
+    #
+    # If your solve method returns source coefficients x_src, we convert them
+    # back to detector-pixel coefficients with M @ x_src.
+    #
+    # If your solve method already returns detector-pixel coefficients,
+    # remove the "M @ x_src" line below.
+    x_src = solver.solve(
+        dispersed,
+        support_mask=support_mask,
+        M=M,
+    )
+
+    print("Recovered source vector shape:", x_src.shape)
+
+    if x_src.shape[0] == n_src * n:
+        recovered = M @ x_src
+    elif x_src.shape[0] == n_pix_det * n:
+        recovered = x_src
+    else:
+        raise ValueError(
+            f"Unexpected recovered vector shape {x_src.shape}. "
+            f"Expected either {n_src*n} or {n_pix_det*n}."
+        )
+
+    recovered = np.asarray(recovered).ravel()
+
+    print("Recovered detector coefficient vector shape:", recovered.shape)
+
+    # ---------------------------------------------------------------------
+    # Recovered direct image and residuals
+    # ---------------------------------------------------------------------
+
+    recovered_img = basis.broadband_image(recovered, DETECTOR_SHAPE)
+    residual_img = np.abs(direct - recovered_img)
+
+    residual_dispersion = np.abs(
+        dispersed - op.apply(recovered).reshape(IMAGE_SHAPE)
+    )
+
+    # ---------------------------------------------------------------------
+    # Optional plots
+    # ---------------------------------------------------------------------
+
+    if PLOTS:
+
+        def _clip(img, lo=1, hi=99):
+            finite = img[np.isfinite(img)]
+            if finite.size == 0:
+                return 0.0, 1.0
+            return np.percentile(finite, lo), np.percentile(finite, hi)
+
+        vmin_dr, vmax_dr = _clip(direct)
+        vmin_d2, vmax_d2 = _clip(dispersed)
+        _, vmax_res_img = _clip(residual_img, lo=1, hi=99)
+        _, vmax_res_disp = _clip(residual_dispersion, lo=1, hi=99)
+
+        fig, axes = plt.subplots(
+            1,
+            4,
+            figsize=(16, 4),
+            constrained_layout=True,
+        )
+
+        kw = dict(
+            origin="lower",
+            aspect="auto",
+            interpolation="nearest",
+            cmap="inferno",
+        )
+
+        im0 = axes[0].imshow(direct, vmin=vmin_dr, vmax=vmax_dr, **kw)
+        im1 = axes[1].imshow(dispersed, vmin=vmin_d2, vmax=vmax_d2, **kw)
+        im2 = axes[2].imshow(recovered_img, vmin=vmin_dr, vmax=vmax_dr, **kw)
+        im3 = axes[3].imshow(
+            residual_dispersion,
+            vmin=0,
+            vmax=vmax_res_disp,
+            **kw,
+        )
+
+        titles = [
+            "Direct image",
+            "Dispersed image",
+            "Recovered direct image",
+            "|dispersed - H recovered|",
+        ]
+
+        for ax, im, title in zip(axes, [im0, im1, im2, im3], titles):
+            ax.set_title(title)
+            ax.set_xlabel("column")
+            ax.set_ylabel("row")
+            fig.colorbar(im, ax=ax)
+
+        fig.suptitle(
+            f"Real-data recovery, "
+            f"n_src={n_src}, "
+            f"pd={pixel_density:.4f}%, "
+            f"sigma={sigma:.3f}"
+        )
+
+        plt.show()
+
+        fig, ax = plt.subplots(figsize=(5, 5), constrained_layout=True)
+        ax.imshow(direct, vmin=vmin_dr, vmax=vmax_dr, **kw)
+
+        for s in sources.values():
+            y0, x0 = s["center"]
+            radius = s["radius"]
+            circ = plt.Circle(
+                (x0, y0),
+                radius,
+                fill=False,
+                edgecolor="cyan",
+                linewidth=0.5,
+                alpha=0.5,
+            )
+            ax.add_patch(circ)
+
+        ax.set_title("Gaussian source supports")
+        ax.set_xlabel("column")
+        ax.set_ylabel("row")
+        plt.show()
+
+    # ---------------------------------------------------------------------
+    # Return
+    # ---------------------------------------------------------------------
+
+    return {
+        "recovered": recovered,
+        "x_src": x_src,
+        "M": M,
+        "sources": sources,
+        "direct": direct,
+        "dispersed": dispersed,
+        "recovered_img": recovered_img,
+        "residual_img": residual_img,
+        "residual_dispersion": residual_dispersion,
+        "sigma": sigma,
+        "psf": psf,
+        "noise_level": noise_level,
+        "pixel density": pixel_density,
+        "source density": source_density,
+        "support_mask": support_mask,
+    }
     
+# result = run_real_scene_optimized_recovery(
+#     direct_fits="direct_image.fits",
+#     dispersed_fits="dispersed_image.fits",
+#     catalog_files=[
+#         "tri-00-ir.cat.fits",
+#         "tri-02-ir.cat.fits",
+#     ],
+#     op=op,
+#     basis=basis,
+#     wcs_reference_fits="direct_image.fits",
+#     ra_col="RA",
+#     dec_col="DEC",
+#     instrument_name="NIRISS",
+#     filter_name="F150W",
+#     detector=None,
+#     noise_factor=3.0,
+#     min_radius_sigma=1.5,
+#     max_radius_sigma=6.0,
+#     PLOTS=True,
+# )
 
-result = run_real_image_pipeline(
-    direct_path=r"C:\Users\anika\GitHub\spectrex\testdata\RateFiles\Match\jw01090001001_28101_00001_nis_rate.fits",
-    dispersed_path=r"C:\Users\anika\GitHub\spectrex\testdata\RateFiles\Match\jw01090001001_27101_00004_nis_rate.fits",
-    plots=True,
-    parity=True,
+
+def query_niriss_program(program=3383):
+    missions = MastMissions(mission="jwst")
+
+    obs = missions.query_criteria(
+        instrume="NIRISS",
+        program=program,
+        select_cols=[
+            "filename",
+            "productLevel",
+            "targprop",
+            "targ_ra",
+            "targ_dec",
+            "instrume",
+            "exp_type",
+            "filter",
+            "date_obs",
+            "time_obs",
+            "duration",
+            "program",
+            "opticalElements",
+            "observtn",
+            "visit",
+            "niriss_pupil",
+            "niriss_fwcpos",
+            "niriss_pwcpos",
+        ],
+    )
+
+    return obs
+
+
+def add_time_and_position_columns(obs):
+    obs["coord"] = SkyCoord(obs["targ_ra"] * u.deg, obs["targ_dec"] * u.deg)
+
+    # Some JWST tables have date_obs and time_obs separately.
+    if "time_obs" in obs.colnames:
+        t = Time(
+            [f"{d}T{t}" for d, t in zip(obs["date_obs"], obs["time_obs"])],
+            format="isot",
+            scale="utc",
+        )
+    else:
+        t = Time(obs["date_obs"], format="isot", scale="utc")
+
+    obs["mjd"] = t.mjd
+    return obs
+
+
+def find_direct_grism_pairs(
+    obs,
+    target_ra,
+    target_dec,
+    max_sep_arcsec=5.0,
+    max_time_delta_min=30.0,
+    grism="GR150R",
+    same_filter=True,
+):
+    target = SkyCoord(target_ra * u.deg, target_dec * u.deg)
+
+    coords = SkyCoord(obs["targ_ra"] * u.deg, obs["targ_dec"] * u.deg)
+    sep = coords.separation(target).arcsec
+
+    obs = obs[sep < max_sep_arcsec]
+    obs["sep_arcsec"] = sep[sep < max_sep_arcsec]
+
+    direct_mask = np.array([
+        "IMAGE" in str(x).upper()
+        for x in obs["exp_type"]
+    ])
+
+    grism_mask = np.array([
+        ("WFSS" in str(exp).upper() or "GRISM" in str(exp).upper())
+        and grism in str(pupil).upper()
+        for exp, pupil in zip(obs["exp_type"], obs["niriss_pupil"])
+    ])
+
+    direct = obs[direct_mask]
+    grism_obs = obs[grism_mask]
+
+    pairs = []
+
+    for g in grism_obs:
+        candidates = []
+
+        for d in direct:
+            same_obs_block = (
+                str(g["program"]) == str(d["program"])
+                and str(g["observtn"]) == str(d["observtn"])
+                and str(g["visit"]) == str(d["visit"])
+            )
+
+            if not same_obs_block:
+                continue
+
+            if same_filter and str(g["filter"]) != str(d["filter"]):
+                continue
+
+            dg = SkyCoord(g["targ_ra"] * u.deg, g["targ_dec"] * u.deg)
+            dd = SkyCoord(d["targ_ra"] * u.deg, d["targ_dec"] * u.deg)
+            pair_sep = dg.separation(dd).arcsec
+
+            dt_min = abs(g["mjd"] - d["mjd"]) * 24.0 * 60.0
+
+            if pair_sep <= max_sep_arcsec and dt_min <= max_time_delta_min:
+                candidates.append((dt_min, pair_sep, d, g))
+
+        if candidates:
+            candidates.sort(key=lambda x: (x[0], x[1]))
+            pairs.append(candidates[0])
+
+    return pairs
+obs = query_niriss_program(program=3383)
+obs = add_time_and_position_columns(obs)
+
+pairs = find_direct_grism_pairs(
+    obs,
+    target_ra=23.35,
+    target_dec=30.49,
+    max_sep_arcsec=5.0,
+    max_time_delta_min=30.0,
+    grism="GR150R",
+    same_filter=True,
 )
+
+for dt_min, sep_arcsec, direct, grism in pairs:
+    print()
+    print("PAIR")
+    print("dt [min]   =", dt_min)
+    print("sep [arcsec] =", sep_arcsec)
+    print("direct:", direct["filename"], direct["exp_type"], direct["filter"], direct["niriss_pupil"])
+    print("grism: ", grism["filename"], grism["exp_type"], grism["filter"], grism["niriss_pupil"])

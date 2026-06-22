@@ -24,8 +24,8 @@ IMAGES = HERE / "unittests" / "Images"
 # set cold_start true if anything in this configuration section is changed or delete operator chache
 COLD_START = False    # set True to force operator rebuild from scratch
 IMAGE_SHAPE = (500, 20) # Main frame
-DETECTOR_SHAPE = (1000,40) # Extended frame
-SOURCE_ORIGIN = (250,10) # (0,0) of Detector starts at (10,200)
+DETECTOR_SHAPE = (355+500+10,26) # Extended frame
+SOURCE_ORIGIN = (180,3) # (0,0) of Detector starts at (10,200)
 SOURCE_DENSITY = 0.05  # fraction of pixels with injected sources
 SEED = 50
 N_COMPONENTS = 10     # must match eigenspectra CSV
@@ -294,12 +294,23 @@ def run_mock_scene_optimized_recovery(
             true_flux = np.array([])
             rec_flux = np.array([])
 
+        l2_errors = []
+
+        for k in active_indices:
+            spectrum_true = basis.reconstruct(a_tilde[k*n:(k+1)*n])
+            spectrum_rec  = basis.reconstruct(recovered[k*n:(k+1)*n])
+
+            l2_errors.append(
+                np.linalg.norm(spectrum_rec - spectrum_true)
+                / (np.linalg.norm(spectrum_true) + 1e-8)
+            )
+
+        mean_l2_error = np.mean(l2_errors)
         fig, axes = plt.subplots(2, 1, figsize=(5, 8), sharex=True, tight_layout=True, height_ratios=(1, 0.6), gridspec_kw={'hspace': 0})
         ax = axes[0]
-        outliers = rec_flux <= 1.
+        
 
-        ax.scatter(true_flux[~outliers], rec_flux[~outliers], s=2, alpha=0.05, linewidths=0, color="C0", rasterized=True)
-        ax.scatter(true_flux[outliers], rec_flux[outliers], s=2, alpha=0.05, linewidths=0, color="C1", rasterized=True)
+        ax.scatter(true_flux, rec_flux, s=2, alpha=0.05, linewidths=0, color="C0", rasterized=True)
         
         if true_flux.size > 0 and rec_flux.size > 0:
             minv = max(min(true_flux.min(), rec_flux.min()), 0)
@@ -323,14 +334,22 @@ def run_mock_scene_optimized_recovery(
 
         ax = axes[1]
         frac_residuals = (true_flux - rec_flux) / true_flux
-        ax.scatter(true_flux[~outliers], frac_residuals[~outliers], s=2, alpha=0.05, linewidths=0, color="C0", rasterized=True)
-        ax.scatter(true_flux[outliers], frac_residuals[outliers], s=2, alpha=0.05, linewidths=0, color="C1", rasterized=True)
+        ax.scatter(true_flux, frac_residuals, s=2, alpha=0.05, linewidths=0, color="C0", rasterized=True)
         ax.set_ylim(-2, 2)
         ax.set_xlabel("True flux  f(λ)")
-        rmse_noiseless_good = np.sqrt(np.mean(frac_residuals[~outliers]) ** 2)
-        ax.text(0.05, 0.92, f"frac. mean error = {rmse_noiseless_good:.4f}", color='C0',
+        rmse_noiseless_good = np.sqrt(np.mean(((true_flux - rec_flux) / true_flux)**2))
+        print("RMSE:", rmse_noiseless_good)
+        ax.text(0.05, 0.92, f"RMSE = {rmse_noiseless_good:.4f}", color='C0',
                 transform=ax.transAxes, fontsize=10,
                 bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8))
+        ax.text(
+            0.05, 0.82,
+            f"mean rel. L2 = {mean_l2_error:.4f}",
+            transform=ax.transAxes,
+            fontsize=10,
+            bbox=dict(boxstyle="round,pad=0.3",
+                    fc="white", ec="gray", alpha=0.8)
+        )
         fig.tight_layout()
 
         filename = IMAGES / (
@@ -350,9 +369,6 @@ def run_mock_scene_optimized_recovery(
         rec_flux = np.concatenate(
             [basis.reconstruct(recovered[k * n : (k + 1) * n]) for k in active_indices]
         )
-
-        rmse_noiseless = np.sqrt(np.mean((true_flux - rec_flux) ** 2))
-        print(f"Noiseless RMSE (flux): {rmse_noiseless:.6f}")
 
 
         recovered_img = basis.broadband_image(recovered, DETECTOR_SHAPE)
@@ -455,11 +471,11 @@ def run_mock_scene_optimized_recovery(
     average = norm / count if count > 0 else 0
 
     print("Pixel density of recoverable sources:", pixel_dens)
-    print("MSE =", average)
+    print("L2 error =", average)
 
     return {
         "pixel density": pixel_dens,
-        "mse": average,
+        "L2 error": average,
         "recovered": recovered,
         "a_tilde": a_tilde,
         "direct": direct,
@@ -2041,7 +2057,7 @@ def run_densities(
 
     return fig, ax1
 ################parity plots
-DENSITY= 0.11
+DENSITY= 0.1
 SINGLE_SOURCE = (31,250)
 SEED = 42
 rng = np.random.default_rng(SEED)
@@ -2071,22 +2087,22 @@ run_mock_scene_optimized_recovery(
                 PLOTS=True,
             )
 
-SEED = 42
-rng = np.random.default_rng(SEED)
+# SEED = 42
+# rng = np.random.default_rng(SEED)
 
-run_noise_mock_scene_optimized_recovery(
-                SOURCE_DENSITY=DENSITY,
-                op=op,
-                basis=basis,
-                IMAGE_SHAPE=IMAGE_SHAPE,
-                DETECTOR_SHAPE=DETECTOR_SHAPE,
-                rng=rng,
-                PARITY=True,
-                PLOTS=True,
-            )
+# run_noise_mock_scene_optimized_recovery(
+#                 SOURCE_DENSITY=DENSITY,
+#                 op=op,
+#                 basis=basis,
+#                 IMAGE_SHAPE=IMAGE_SHAPE,
+#                 DETECTOR_SHAPE=DETECTOR_SHAPE,
+#                 rng=rng,
+#                 PARITY=True,
+#                 PLOTS=True,
+#             )
 
-SEED = 42
-rng = np.random.default_rng(SEED)
+# SEED = 42
+# rng = np.random.default_rng(SEED)
 
 # single_source_run_noise_mock_scene_optimized_recovery(
 #                 POSITION= SINGLE_SOURCE,
