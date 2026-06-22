@@ -15,7 +15,10 @@ import numpy as np
 
 from astropy.io import fits
 from astropy.table import Table
+import os
 
+os.environ["CRDS_PATH"] = str(Path.home() / "crds_cache")
+os.environ["CRDS_SERVER_URL"] = "https://jwst-crds.stsci.edu"
 
 from jwst import datamodels
 from jwst.assign_wcs import AssignWcsStep
@@ -23,7 +26,6 @@ from jwst.assign_wcs import AssignWcsStep
 import stpsf
 
 
-import spectrex
 from spectrex import (
     EigenspectraBasis,
     InstrumentConfig,
@@ -41,24 +43,20 @@ IMAGES = HERE / "unittests" / "Images"
 # ── Configuration ─────────────────────────────────────────────────────────────
 # set cold_start true if anything in this configuration section is changed or delete operator chache
 COLD_START = False    # set True to force operator rebuild from scratch
-IMAGE_SHAPE = (500, 20) # Main frame
-DETECTOR_SHAPE = (355+500+10,26) # Extended frame
-SOURCE_ORIGIN = (180,3) # (0,0) of Detector starts at (10,200)
-SOURCE_DENSITY = 0.05  # fraction of pixels with injected sources
-SEED = 50
-N_COMPONENTS = 10     # must match eigenspectra CSV
+DIRECT_FULL_ORIGIN = (300,20) # (0,0) of direct image is at DIRECT_FULL_ORIGIN of full size image
+IMAGE_SHAPE = (20, 1400) # Main frame
+DETECTOR_SHAPE = (30,2000) # Direct image shape
+SOURCE_ORIGIN = (5,300) # (0,0) of main frame is at SOURCE_ORIGEIN of Direct image
+N_COMPONENTS = 10     # must match eigenspectra CSV, basis components
 
-rng = np.random.default_rng(SEED)
-
-print(f"spectrex {spectrex.__version__}")
 
 # ── Instrument configuration & eigenspectra basis ───────────────────────────────────────
 
 config = InstrumentConfig.from_files(
-    conf_path=TESTDATA / "Config Files" / "GR150R.F150W.220725.conf",
+    conf_path=TESTDATA / "Config Files" / "GR150C.F200W.220725.conf",
     wavelengthrange_path=TESTDATA / "jwst_niriss_wavelengthrange_0002.asdf",
     sensitivity_dir=TESTDATA / "SenseConfig" / "wfss-grism-configuration",
-    filter_name="F150W",
+    filter_name="F200W",
     n_wavelengths=150,
 )
 
@@ -88,19 +86,19 @@ else:
     print(f"Shape: {op._H.shape[0]} × {op._H.shape[1]}")
 
 # Helper
-def _clip(arr, nsigma_lo=2, nsigma_hi=2):
+def _clipping(arr, nsigma_lo=2, nsigma_hi=2):
     m, s = np.nanmean(arr), np.nanstd(arr)
     return m - nsigma_lo * s, m + nsigma_hi * s   
 
 
 
 # -------------------------------------------------------------------------
-# STPSF sigma estimation
+# STPSF sigma estimation (but actually known sigma and fix)
 # -------------------------------------------------------------------------
 
 def estimate_sigma_from_stpsf(
     instrument_name="NIRISS",
-    filter_name="F150W",
+    filter_name="F200W",
     detector=None,
     fov_pixels=64,
     oversample=4,
@@ -170,9 +168,13 @@ def get_wcs_world_to_detector(filename):
 def read_catalog_sources_world_to_detector(
     catalog_files,
     wcs,
+    crop_origin=(0, 0),   # (y0_crop, x0_crop)
+    crop_shape=None,      # (H, W)
     ra_col="RA",
     dec_col="DEC",
 ):
+    y0_crop, x0_crop = crop_origin
+    
     xs = []
     ys = []
     source_catalog = []
@@ -203,11 +205,19 @@ def read_catalog_sources_world_to_detector(
         ra = np.asarray(tab[ra_name], dtype=float)
         dec = np.asarray(tab[dec_name], dtype=float)
 
-        x_det, y_det, *_ = wcs(ra, dec, ra, dec)
+        x_full, y_full = wcs(ra, dec)
+        
+        x_stamp = np.asarray(x_full, dtype=float) - x0_crop
+        y_stamp = np.asarray(y_full, dtype=float) - y0_crop
 
-        for i, (x0, y0) in enumerate(zip(x_det, y_det)):
+        for i, (x0, y0) in enumerate(zip(x_stamp, y_stamp)):
             if not np.isfinite(x0) or not np.isfinite(y0):
                 continue
+            
+            if crop_shape is not None:
+                H, W = crop_shape
+                if not (0 <= x0 < W and 0 <= y0 < H):
+                    continue
 
             xs.append(float(x0))
             ys.append(float(y0))
@@ -341,7 +351,7 @@ def gaussian_source_pixels_from_direct_image(
     sigma,
     noise_level,
     noise_factor=3.0,
-    min_radius_sigma=1.5,
+    min_radius_sigma=0.5,
     max_radius_sigma=6.0,
     background_radius=6,
     aperture_radius=1,
@@ -417,7 +427,7 @@ def run_real_scene_optimized_recovery(
     dec_col="DEC",
     solver_kwargs=None,
     instrument_name="NIRISS",
-    filter_name="F150W",
+    filter_name="F200W",
     detector=None,
     stpsf_fov_pixels=64,
     stpsf_oversample=4,
@@ -430,6 +440,8 @@ def run_real_scene_optimized_recovery(
     background_radius=6,
     aperture_radius=1,
     PLOTS=False,
+    direct_stamp_shape=(1000, 50),
+    dispersed_stamp_shape=(500, 20),
 ):
     """
     Real-data version of run_mock_scene_optimized_recovery.
@@ -460,7 +472,37 @@ def run_real_scene_optimized_recovery(
 
     direct = read_fits_image(direct_fits, ext=direct_ext)
     dispersed = read_fits_image(dispersed_fits, ext=dispersed_ext)
+    vmin_dr, vmax_dr = _clipping(direct)
+    vmin_d2, vmax_d2 = _clipping(dispersed)
+    plt.figure(figsize=(4, 8))
+    plt.imshow(direct, origin="lower", aspect="auto", cmap="inferno", vmin= vmin_dr, vmax= vmax_dr)
+    plt.title("Original direct image")
+    plt.colorbar()
+    plt.show()
 
+    plt.figure(figsize=(4, 8))
+    plt.imshow(dispersed, origin="lower", aspect="auto", cmap="inferno", vmin= vmin_d2, vmax= vmax_d2)
+    plt.title("Original dispersed image")
+    plt.colorbar()
+    plt.show()
+
+    direct = direct[DIRECT_FULL_ORIGIN[0]:DIRECT_FULL_ORIGIN[0]+direct_stamp_shape[0], DIRECT_FULL_ORIGIN[1]:DIRECT_FULL_ORIGIN[1]+direct_stamp_shape[1]]
+    dispersed = dispersed[DIRECT_FULL_ORIGIN[0]+ SOURCE_ORIGIN[0]:DIRECT_FULL_ORIGIN[0]+SOURCE_ORIGIN[0]+dispersed_stamp_shape[0], DIRECT_FULL_ORIGIN[1]+SOURCE_ORIGIN[1] :DIRECT_FULL_ORIGIN[1]+SOURCE_ORIGIN[1]+dispersed_stamp_shape[1]]
+    
+    vmin_dr, vmax_dr = _clipping(direct)
+    vmin_d2, vmax_d2 = _clipping(dispersed)
+    plt.figure(figsize=(4, 8))
+    plt.imshow(direct, origin="lower", aspect="auto", cmap="inferno", vmin= vmin_dr, vmax= vmax_dr)
+    plt.title("Original clipped direct image")
+    plt.colorbar()
+    plt.show()
+
+    plt.figure(figsize=(4, 8))
+    plt.imshow(dispersed, origin="lower", aspect="auto", cmap="inferno", vmin= vmin_d2, vmax= vmax_d2)
+    plt.title("Original clipped dispersed image")
+    plt.colorbar()
+    plt.show()
+        
     DETECTOR_SHAPE = direct.shape
     IMAGE_SHAPE = dispersed.shape
 
@@ -486,6 +528,8 @@ def run_real_scene_optimized_recovery(
     x_det, y_det, source_catalog, source_index = read_catalog_sources_world_to_detector(
         catalog_files=catalog_files,
         wcs=wcs,
+        crop_origin= DIRECT_FULL_ORIGIN,
+        crop_shape=DETECTOR_SHAPE,
         ra_col=ra_col,
         dec_col=dec_col,
     )
@@ -763,27 +807,6 @@ def run_real_scene_optimized_recovery(
         "source density": source_density,
         "support_mask": support_mask,
     }
-    
-# result = run_real_scene_optimized_recovery(
-#     direct_fits="direct_image.fits",
-#     dispersed_fits="dispersed_image.fits",
-#     catalog_files=[
-#         "tri-00-ir.cat.fits",
-#         "tri-02-ir.cat.fits",
-#     ],
-#     op=op,
-#     basis=basis,
-#     wcs_reference_fits="direct_image.fits",
-#     ra_col="RA",
-#     dec_col="DEC",
-#     instrument_name="NIRISS",
-#     filter_name="F150W",
-#     detector=None,
-#     noise_factor=3.0,
-#     min_radius_sigma=1.5,
-#     max_radius_sigma=6.0,
-#     PLOTS=True,
-# )
 
 
 def query_niriss_program(program=3383):
@@ -834,36 +857,260 @@ def add_time_and_position_columns(obs):
     return obs
 
 
-def find_direct_grism_pairs(
+def download_pair_from_archivefileid_debug(
+    direct_row,
+    grism_row,
+    download_dir="mast_downloads",
+):
+    download_dir = Path(download_dir).resolve()
+    download_dir.mkdir(parents=True, exist_ok=True)
+
+    missions = MastMissions(mission="jwst")
+
+    direct_id = str(direct_row["ArchiveFileID"])
+    grism_id = str(grism_row["ArchiveFileID"])
+
+    paths = []
+
+    for label, archive_id in [
+        ("direct", direct_id),
+        ("grism", grism_id),
+    ]:
+        local_path = download_dir / f"{label}_{archive_id}.fits"
+
+        print(f"\nDownloading {label}")
+        print("ArchiveFileID:", archive_id)
+        print("Requested local_path:", local_path)
+
+        result = missions.download_file(
+            archive_id,
+            local_path=str(local_path),
+        )
+
+        print("download_file returned:", result)
+        print("Exists at requested path:", local_path.exists())
+
+        paths.append(str(local_path))
+
+    print("\nFiles currently in download_dir:")
+    for p in download_dir.glob("*"):
+        print(p)
+
+    return paths[0], paths[1]
+
+from pathlib import Path
+
+import numpy as np
+import astropy.units as u
+
+from astropy.coordinates import SkyCoord
+from astropy.table import vstack
+from astroquery.mast import Observations
+
+
+def download_pair_with_observations(
+    direct_row,
+    grism_row,
+    download_dir="mast_downloads",
+    prefer_suffix="_rate.fits",
+):
+    """
+    Download one direct/WFSS image pair using astroquery Observations.
+
+    Parameters
+    ----------
+    direct_row, grism_row
+        Rows from your paired MastMissions table.
+    download_dir : str or Path
+        Output directory.
+    prefer_suffix : str
+        Prefer '_rate.fits'
+
+    Returns
+    -------
+    direct_fits, grism_fits : str
+        Local paths to downloaded FITS files.
+    """
+
+    download_dir = Path(download_dir).resolve()
+    download_dir.mkdir(parents=True, exist_ok=True)
+
+    coord = SkyCoord(
+        float(direct_row["targ_ra"]) * u.deg,
+        float(direct_row["targ_dec"]) * u.deg,
+    )
+
+    obs = Observations.query_criteria(
+        coordinates=coord,
+        radius=1 * u.arcmin,
+        obs_collection="JWST",
+        instrument_name="NIRISS*",
+        proposal_id=str(direct_row["program"]),
+    )
+
+    products = Observations.get_product_list(obs)
+
+    direct_obs = str(direct_row["observtn"]).zfill(3)
+    grism_obs = str(grism_row["observtn"]).zfill(3)
+
+    program = f"jw{int(direct_row['program']):05d}"
+
+    def select_product(row, obs_number, kind):
+        names = np.asarray(products["productFilename"]).astype(str)
+
+        mask = np.array([
+            name.endswith(".fits")
+            for name in names
+        ])
+
+        # Match program + observation number in JWST filename.
+        obs_token = f"{program}{obs_number}"
+        obs_mask = np.array([
+            obs_token in name
+            for name in names
+        ])
+
+        if np.any(mask & obs_mask):
+            mask &= obs_mask
+
+        # Prefer calibrated / rate products.
+        suffix_mask = np.array([
+            name.endswith(prefer_suffix)
+            for name in names
+        ])
+
+        if np.any(mask & suffix_mask):
+            mask &= suffix_mask
+
+        # Keep only useful science products if this metadata exists.
+        if "productSubGroupDescription" in products.colnames:
+            subgroup = np.asarray(products["productSubGroupDescription"]).astype(str)
+
+            science_mask = np.array([
+                s.upper() in {"CAL", "RATE", "I2D"}
+                for s in subgroup
+            ])
+
+            if np.any(mask & science_mask):
+                mask &= science_mask
+
+        selected = products[mask]
+
+        if len(selected) == 0:
+            raise RuntimeError(
+                f"No {kind} product found for observation {obs_number}."
+            )
+
+        print(f"\n{kind} candidates:")
+        for name in selected["productFilename"]:
+            print("  ", name)
+
+        return selected[:1]
+
+    direct_product = select_product(
+        direct_row,
+        direct_obs,
+        kind="direct",
+    )
+
+    grism_product = select_product(
+        grism_row,
+        grism_obs,
+        kind="grism",
+    )
+
+    selected_products = vstack([direct_product, grism_product])
+
+    manifest = Observations.download_products(
+        selected_products,
+        download_dir=str(download_dir),
+    )
+
+    print("\nDownload manifest:")
+    print(manifest)
+
+    local_paths = list(manifest["Local Path"])
+
+    if len(local_paths) != 2:
+        raise RuntimeError(
+            f"Expected 2 downloaded files, got {len(local_paths)}."
+        )
+
+    direct_fits = Path(local_paths[0])
+    grism_fits = Path(local_paths[1])
+
+    if not direct_fits.exists():
+        raise FileNotFoundError(direct_fits)
+
+    if not grism_fits.exists():
+        raise FileNotFoundError(grism_fits)
+
+    return str(direct_fits), str(grism_fits)
+
+def find_direct_grism_pairs_debug(
     obs,
     target_ra,
     target_dec,
-    max_sep_arcsec=5.0,
-    max_time_delta_min=30.0,
-    grism="GR150R",
-    same_filter=True,
+    max_target_sep_arcsec=300.0,
+    max_pair_sep_arcsec=300.0,
+    max_time_delta_min=360.0,
+    grism="GR150C",
 ):
     target = SkyCoord(target_ra * u.deg, target_dec * u.deg)
 
     coords = SkyCoord(obs["targ_ra"] * u.deg, obs["targ_dec"] * u.deg)
-    sep = coords.separation(target).arcsec
+    sep_to_target = coords.separation(target).arcsec
 
-    obs = obs[sep < max_sep_arcsec]
-    obs["sep_arcsec"] = sep[sep < max_sep_arcsec]
+    obs = obs[sep_to_target < max_target_sep_arcsec]
+    obs["sep_to_target_arcsec"] = sep_to_target[sep_to_target < max_target_sep_arcsec]
+
+    print("Rows near target:", len(obs))
+
+    for col in [
+        "exp_type",
+        "filter",
+        "opticalElements",
+        "niriss_pupil",
+        "niriss_fwcpos",
+        "niriss_pwcpos",
+        "observtn",
+        "visit",
+    ]:
+        if col in obs.colnames:
+            print("\n", col)
+            print(np.unique(np.asarray(obs[col]).astype(str)))
 
     direct_mask = np.array([
         "IMAGE" in str(x).upper()
         for x in obs["exp_type"]
     ])
 
-    grism_mask = np.array([
-        ("WFSS" in str(exp).upper() or "GRISM" in str(exp).upper())
-        and grism in str(pupil).upper()
-        for exp, pupil in zip(obs["exp_type"], obs["niriss_pupil"])
-    ])
+    grism_mask = np.zeros(len(obs), dtype=bool)
+
+    for col in [
+        "niriss_pupil",
+        "opticalElements",
+        "niriss_fwcpos",
+        "niriss_pwcpos",
+        "filter",
+    ]:
+        if col in obs.colnames:
+            grism_mask |= np.array([
+                grism in str(x).upper()
+                for x in obs[col]
+            ])
+
+    if "exp_type" in obs.colnames:
+        grism_mask &= np.array([
+            ("WFSS" in str(x).upper()) or ("GRISM" in str(x).upper())
+            for x in obs["exp_type"]
+        ])
 
     direct = obs[direct_mask]
     grism_obs = obs[grism_mask]
+
+    print("\nDirect candidates:", len(direct))
+    print("Grism candidates:", len(grism_obs))
 
     pairs = []
 
@@ -871,49 +1118,86 @@ def find_direct_grism_pairs(
         candidates = []
 
         for d in direct:
-            same_obs_block = (
-                str(g["program"]) == str(d["program"])
-                and str(g["observtn"]) == str(d["observtn"])
-                and str(g["visit"]) == str(d["visit"])
-            )
-
-            if not same_obs_block:
+            # Do NOT require same observtn at first.
+            if str(g["program"]) != str(d["program"]):
                 continue
 
-            if same_filter and str(g["filter"]) != str(d["filter"]):
-                continue
+            # Prefer same visit, but allow different visit for debugging.
+            same_visit = str(g["visit"]) == str(d["visit"])
 
-            dg = SkyCoord(g["targ_ra"] * u.deg, g["targ_dec"] * u.deg)
-            dd = SkyCoord(d["targ_ra"] * u.deg, d["targ_dec"] * u.deg)
-            pair_sep = dg.separation(dd).arcsec
+            cg = SkyCoord(g["targ_ra"] * u.deg, g["targ_dec"] * u.deg)
+            cd = SkyCoord(d["targ_ra"] * u.deg, d["targ_dec"] * u.deg)
 
+            pair_sep = cg.separation(cd).arcsec
             dt_min = abs(g["mjd"] - d["mjd"]) * 24.0 * 60.0
 
-            if pair_sep <= max_sep_arcsec and dt_min <= max_time_delta_min:
-                candidates.append((dt_min, pair_sep, d, g))
+            if pair_sep <= max_pair_sep_arcsec and dt_min <= max_time_delta_min:
+                candidates.append((dt_min, pair_sep, same_visit, d, g))
 
         if candidates:
-            candidates.sort(key=lambda x: (x[0], x[1]))
+            candidates.sort(key=lambda x: (not x[2], x[0], x[1]))
             pairs.append(candidates[0])
 
     return pairs
-obs = query_niriss_program(program=3383)
-obs = add_time_and_position_columns(obs)
 
-pairs = find_direct_grism_pairs(
-    obs,
-    target_ra=23.35,
-    target_dec=30.49,
-    max_sep_arcsec=5.0,
-    max_time_delta_min=30.0,
-    grism="GR150R",
-    same_filter=True,
+print("I run")
+# obs = query_niriss_program(program=3383)
+# obs = add_time_and_position_columns(obs)
+# #print(obs.colnames)
+
+# pairs = find_direct_grism_pairs_debug(
+#     obs,
+#     target_ra=23.35,
+#     target_dec=30.49,
+#     max_target_sep_arcsec=300.0,
+#     max_pair_sep_arcsec=300.0,
+#     max_time_delta_min=360.0,
+#     grism="GR150C",
+# )
+
+# if len(pairs) == 0:
+#     print("No pairs.")
+# else:
+#     for dt_min, sep_arcsec, same_visit, direct, grism in pairs:
+#         print("\nPAIR")
+#         print("dt [min]      =", dt_min)
+#         print("sep [arcsec]  =", sep_arcsec)
+#         print("same visit    =", same_visit)
+#         print("direct:", direct["ArchiveFileID"], direct["exp_type"], direct["filter"], direct["niriss_pupil"])
+#         print("grism: ", grism["ArchiveFileID"], grism["exp_type"], grism["filter"], grism["niriss_pupil"])
+        
+# dt_min, sep_arcsec, same_visit, direct_row, grism_row = pairs[0]
+
+# direct_fits, dispersed_fits = download_pair_with_observations(
+#     direct_row,
+#     grism_row,
+#     download_dir="mast_downloads",
+#     prefer_suffix="_rate.fits",
+# )
+
+# print("direct_fits    =", direct_fits)
+# print("dispersed_fits =", dispersed_fits)
+
+direct_fits = HERE / "mast_downloads"/"mastDownload"/"JWST"/"jw03383181001_03201_00002_nis"/"jw03383181001_03201_00002_nis_rate.fits"
+dispersed_fits = HERE/ "mast_downloads"/"mastDownload"/"JWST"/"jw03383182001_05201_00003_nis"/"jw03383182001_05201_00003_nis_rate.fits"
+
+result = run_real_scene_optimized_recovery(
+    direct_fits=direct_fits,
+    dispersed_fits=dispersed_fits,
+    catalog_files= [TESTDATA / "Catalog" / "tri-00-ir.cat.fits"],
+    op=op,
+    basis=basis,
+    wcs_reference_fits=direct_fits,
+    ra_col="RA",
+    dec_col="DEC",
+    instrument_name="NIRISS",
+    filter_name="F200W",
+    detector=None,
+    noise_factor=3.0,
+    min_radius_sigma=0.25,
+    max_radius_sigma=6.0,
+    fixed_sigma=1.61,
+    PLOTS=True,
+    direct_stamp_shape=DETECTOR_SHAPE,
+    dispersed_stamp_shape=IMAGE_SHAPE,
 )
-
-for dt_min, sep_arcsec, direct, grism in pairs:
-    print()
-    print("PAIR")
-    print("dt [min]   =", dt_min)
-    print("sep [arcsec] =", sep_arcsec)
-    print("direct:", direct["filename"], direct["exp_type"], direct["filter"], direct["niriss_pupil"])
-    print("grism: ", grism["filename"], grism["exp_type"], grism["filter"], grism["niriss_pupil"])

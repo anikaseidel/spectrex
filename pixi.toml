@@ -2,7 +2,7 @@
 authors = ["Anika Seidel <79158148+anikaseidel@users.noreply.github.com>"]
 channels = ["conda-forge"]
 name = "spectrex"
-platforms = ["win-64"]
+platforms = ["win-64","linux-64"]
 version = "0.1.0"
 
 [tasks]
@@ -12,3 +12,12 @@ photutils = ">=3.0.0,<4"
 pip = ">=26.1.2,<27"
 astroquery = ">=0.4.11,<0.5"
 python = "3.12.*"
+
+[feature.jwst-env.dependencies]
+python = "3.12.*"
+pip = "*"
+
+
+[environments]
+default = {features = []}
+jwst-env = { features = ["jwst-env"] }
