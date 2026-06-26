@@ -467,6 +467,7 @@ def run_real_scene_optimized_recovery(
     background_radius=6,
     aperture_radius=1,
     PLOTS=False,
+    Save = False,
     direct_stamp_shape=(1000, 50),
     dispersed_stamp_shape=(500, 20),
 ):
@@ -853,8 +854,18 @@ def run_real_scene_optimized_recovery(
             f"pd={pixel_density:.4f}%, "
             f"sigma={sigma:.3f}"
         )
-
-        plt.show()
+        if Save == True:
+            outdir = Path("unittests/Images")
+            outdir.mkdir(parents=True, exist_ok=True)
+            fig.savefig(
+                outdir / f"recovery_summary_{n_src}_{sigma:.2f}.png",
+                dpi=300,
+                bbox_inches="tight",
+            )
+            plt.close(fig)
+            
+        else:
+            plt.show()
 
         fig, ax = plt.subplots(figsize=(5, 5), constrained_layout=True)
         ax.imshow(direct, vmin=vmin_dr, vmax=vmax_dr, **kw)
@@ -875,7 +886,16 @@ def run_real_scene_optimized_recovery(
         ax.set_title("Gaussian source supports")
         ax.set_xlabel("column")
         ax.set_ylabel("row")
-        plt.show()
+        if Save == True:
+            fig.savefig(
+                outdir / f"source_supports_{n_src}_{sigma:.2f}.png",
+                dpi=300,
+                bbox_inches="tight",
+            )
+            plt.close(fig)
+            
+        else:
+            plt.show()
 
     # ---------------------------------------------------------------------
     # Return
@@ -1286,51 +1306,51 @@ for order in config.orders:
     print("y range:", y2.min(), y2.max())
 
 print("I run")
-# obs = query_niriss_program(program=3383)
-# obs = add_time_and_position_columns(obs)
-# #print(obs.colnames)
+obs = query_niriss_program(program=3383)
+obs = add_time_and_position_columns(obs)
+#print(obs.colnames)
 
-# pairs = find_direct_grism_pairs_debug(
-#     obs,
-#     target_ra=23.35,
-#     target_dec=30.49,
-#     max_target_sep_arcsec=300.0,
-#     max_pair_sep_arcsec=300.0,
-#     max_time_delta_min=360.0,
-#     grism="GR150C",
-# )
-# pairs = sorted(
-#     pairs,
-#     key=lambda p: (
-#         not p[2],   # prefer same_visit=True
-#         p[1],       # smaller angular separation
-#         p[0],       # smaller time difference
+pairs = find_direct_grism_pairs_debug(
+    obs,
+    target_ra=23.35,
+    target_dec=30.49,
+    max_target_sep_arcsec=300.0,
+    max_pair_sep_arcsec=300.0,
+    max_time_delta_min=360.0,
+    grism="GR150C",
+)
+pairs = sorted(
+    pairs,
+    key=lambda p: (
+        not p[2],   # prefer same_visit=True
+        p[1],       # smaller angular separation
+        p[0],       # smaller time difference
         
-#     ),
-# )
+    ),
+)
 
-# if len(pairs) == 0:
-#     print("No pairs.")
-# else:
-#     for dt_min, sep_arcsec, same_visit, direct, grism in pairs:
-#         print("\nPAIR")
-#         print("dt [min]      =", dt_min)
-#         print("sep [arcsec]  =", sep_arcsec)
-#         print("same visit    =", same_visit)
-#         print("direct:", direct["ArchiveFileID"], direct["exp_type"], direct["filter"], direct["niriss_pupil"])
-#         print("grism: ", grism["ArchiveFileID"], grism["exp_type"], grism["filter"], grism["niriss_pupil"])
+if len(pairs) == 0:
+    print("No pairs.")
+else:
+    for dt_min, sep_arcsec, same_visit, direct, grism in pairs:
+        print("\nPAIR")
+        print("dt [min]      =", dt_min)
+        print("sep [arcsec]  =", sep_arcsec)
+        print("same visit    =", same_visit)
+        print("direct:", direct["ArchiveFileID"], direct["exp_type"], direct["filter"], direct["niriss_pupil"])
+        print("grism: ", grism["ArchiveFileID"], grism["exp_type"], grism["filter"], grism["niriss_pupil"])
         
-# dt_min, sep_arcsec, same_visit, direct_row, grism_row = pairs[0]
+dt_min, sep_arcsec, same_visit, direct_row, grism_row = pairs[0]
 
-# direct_fits, dispersed_fits = download_pair_with_observations(
-#     direct_row,
-#     grism_row,
-#     download_dir="mast_downloads",
-#     prefer_suffix="_rate.fits",
-# )
+direct_fits, dispersed_fits = download_pair_with_observations(
+    direct_row,
+    grism_row,
+    download_dir="mast_downloads",
+    prefer_suffix="_rate.fits",
+)
 
-# print("direct_fits    =", direct_fits)
-# print("dispersed_fits =", dispersed_fits)
+print("direct_fits    =", direct_fits)
+print("dispersed_fits =", dispersed_fits)
 
 direct_fits = HERE / "mast_downloads"/"mastDownload"/"JWST"/"jw03383181001_03201_00002_nis"/"jw03383181001_03201_00002_nis_rate.fits"
 dispersed_fits = HERE/ "mast_downloads"/"mastDownload"/"JWST"/ "jw03383182001_05201_00003_nis"/"jw03383182001_05201_00003_nis_rate.fits"
@@ -1352,6 +1372,7 @@ result = run_real_scene_optimized_recovery(
     max_radius_sigma=6.0,
     fixed_sigma=1.61, # Note: this is F200W specific. In need of a look up table!!!!
     PLOTS=True,
+    Save = True, # In case of Astronode, cant visualize directly
     direct_stamp_shape=DETECTOR_SHAPE,
     dispersed_stamp_shape=IMAGE_SHAPE,
 )

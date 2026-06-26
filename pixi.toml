@@ -21,3 +21,8 @@ pip = "*"
 [environments]
 default = {features = []}
 jwst-env = { features = ["jwst-env"] }
+
+
+[feature.jwst-env.pypi-dependencies]
+jwst = "*"
+setuptools-scm = "<10"
