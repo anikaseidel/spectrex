@@ -23,9 +23,9 @@ IMAGES = HERE / "unittests" / "Images"
 # ── Configuration ─────────────────────────────────────────────────────────────
 # set cold_start true if anything in this configuration section is changed or delete operator chache
 COLD_START = False    # set True to force operator rebuild from scratch
-IMAGE_SHAPE = (500, 20) # Main frame
-DETECTOR_SHAPE = (355+500+10,26) # Extended frame
-SOURCE_ORIGIN = (180,3) # (0,0) of Detector starts at (10,200)
+IMAGE_SHAPE = (20, 500) # Main frame
+DETECTOR_SHAPE = (30, 900) # Direct image shape
+SOURCE_ORIGIN = (5, 300) # (0,0) of main frame is at SOURCE_ORIGEIN of Direct image
 SOURCE_DENSITY = 0.05  # fraction of pixels with injected sources
 SEED = 50
 N_COMPONENTS = 10     # must match eigenspectra CSV
@@ -37,10 +37,10 @@ print(f"spectrex {spectrex.__version__}")
 # ── Instrument configuration & eigenspectra basis ───────────────────────────────────────
 
 config = InstrumentConfig.from_files(
-    conf_path=TESTDATA / "Config Files" / "GR150R.F150W.220725.conf",
+    conf_path=TESTDATA / "Config Files" / "GR150C.F200W.220725.conf",
     wavelengthrange_path=TESTDATA / "jwst_niriss_wavelengthrange_0002.asdf",
     sensitivity_dir=TESTDATA / "SenseConfig" / "wfss-grism-configuration",
-    filter_name="F150W",
+    filter_name="F200W",
     n_wavelengths=150,
 )
 
@@ -68,6 +68,7 @@ else:
     elapsed = time.perf_counter() - t0
     print(f"Operator built in {elapsed:.1f} s — cached to {OPERATOR_CACHE}")
     print(f"Shape: {op._H.shape[0]} × {op._H.shape[1]}")
+    
 
 # Helper
 def _clip(arr, nsigma_lo=2, nsigma_hi=2):
@@ -355,7 +356,7 @@ def run_mock_scene_optimized_recovery(
         filename = IMAGES / (
                     f"sd{sd:.4f}".replace('.', 'p') +
                     f"_pd{pd:.4f}".replace('.', 'p') +
-                    "_noiseless_GR150R_F150W_parity_plot.png"
+                    "_noiseless_GR150C_F200W_parity_plot.png"
         )
         plt.savefig(filename)
         plt.close()
@@ -421,13 +422,13 @@ def run_mock_scene_optimized_recovery(
             fig.colorbar(im, ax=ax)
             
 
-        fig.suptitle(f"Noiseless recovery — 500 × 20 stamp, GR150R/F150W, sd = {sd:.4f}%, pd = {pd:.4f}%")
+        fig.suptitle(f"Noiseless recovery — 500 × 20 stamp, GR150C/F200W, sd = {sd:.4f}%, pd = {pd:.4f}%")
         #fig.tight_layout()
     
         filename = IMAGES / (
             f"sd{sd:.4f}".replace('.', 'p') +
             f"_pd{pd:.4f}".replace('.', 'p') +
-            "_noiseless_GR150R_F150W.png"
+            "_noiseless_GR150C_F200W.png"
         )
         plt.savefig(filename)
         plt.close()
@@ -719,7 +720,7 @@ def run_mock_scene_recovery(
             #ax.set_aspect('equal', adjustable='box')  # scaled axes
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
        
-        fig.suptitle("Noiseless recovery — 500 × 20 stamp, GR150R/F150W", y=1.01)
+        fig.suptitle("Noiseless recovery — 500 × 20 stamp, GR150C/F200W", y=1.01)
         fig.tight_layout()
         plt.show()
 
@@ -1037,7 +1038,7 @@ def single_source_run_mock_scene_optimized_recovery(
                     f"source_x{POSITION[0]}_y{POSITION[1]}"
                     f"_sd{str(sd).replace('.', 'p')}"
                     f"_pd{str(pd).replace('.', 'p')}"
-                    "_noiseless_GR150R_F150W_parity_plot.png"
+                    "_noiseless_GR150C_F200W_parity_plot.png"
         )
         plt.savefig(filename)
         plt.close()
@@ -1106,14 +1107,14 @@ def single_source_run_mock_scene_optimized_recovery(
             fig.colorbar(im, ax=ax)
             
 
-        fig.suptitle(f"Noiseless recovery — 500 × 20 stamp, GR150R/F150W, sd = {sd:.4f}%, pd = {pd:.4f}%, source position (x0,y0) = {POSITION}")
+        fig.suptitle(f"Noiseless recovery — 500 × 20 stamp, GR150C/F200W, sd = {sd:.4f}%, pd = {pd:.4f}%, source position (x0,y0) = {POSITION}")
         #fig.tight_layout()
     
         filename = IMAGES / (
             f"source_x{POSITION[0]}_y{POSITION[1]}"
             f"_sd{str(sd).replace('.', 'p')}"
             f"_pd{str(pd).replace('.', 'p')}"
-            "_noiseless_GR150R_F150W.png"
+            "_noiseless_GR150C_F200W.png"
         )
         plt.savefig(filename)
         plt.close()
@@ -1446,7 +1447,7 @@ def run_noise_mock_scene_optimized_recovery(
         filename = IMAGES / (
                     f"sd{sd:.4f}".replace('.', 'p') +
                     f"_pd{pd:.4f}".replace('.', 'p') +
-                    "_noise_GR150R_F150W_parity_plot.png"
+                    "_noise_GR150C_F200W_parity_plot.png"
         )
         plt.savefig(filename)
         plt.close()
@@ -1515,13 +1516,13 @@ def run_noise_mock_scene_optimized_recovery(
             fig.colorbar(im, ax=ax)
             
 
-        fig.suptitle(f"Noisy recovery — 500 × 20 stamp, GR150R/F150W, sd = {sd:.4f}%, pd = {pd:.4f}%")
+        fig.suptitle(f"Noisy recovery — 500 × 20 stamp, GR150C/F200W, sd = {sd:.4f}%, pd = {pd:.4f}%")
         #fig.tight_layout()
     
         filename = IMAGES / (
             f"sd{sd:.4f}".replace('.', 'p') +
             f"_pd{pd:.4f}".replace('.', 'p') +
-            "_noise_GR150R_F150W.png"
+            "_noise_GR150C_F200W.png"
         )
         plt.savefig(filename)
         plt.close()
@@ -1847,7 +1848,7 @@ def single_source_run_noise_mock_scene_optimized_recovery(
                     f"source_x{POSITION[0]}_y{POSITION[1]}"
                     f"_sd{str(sd).replace('.', 'p')}"
                     f"_pd{str(pd).replace('.', 'p')}"
-                    "_noisy_GR150R_F150W_parity_plot.png"
+                    "_noisy_GR150C_F200W_parity_plot.png"
         )
         plt.savefig(filename)
         plt.close()
@@ -1916,14 +1917,14 @@ def single_source_run_noise_mock_scene_optimized_recovery(
             fig.colorbar(im, ax=ax)
             
 
-        fig.suptitle(f"Noisy recovery — 500 × 20 stamp, GR150R/F150W, sd = {sd:.4f}%, pd = {pd:.4f}%, source position (x0,y0) = {POSITION}")
+        fig.suptitle(f"Noisy recovery — 500 × 20 stamp, GR150C/F200W, sd = {sd:.4f}%, pd = {pd:.4f}%, source position (x0,y0) = {POSITION}")
         #fig.tight_layout()
     
         filename = IMAGES / (
             f"source_x{POSITION[0]}_y{POSITION[1]}"
             f"_sd{str(sd).replace('.', 'p')}"
             f"_pd{str(pd).replace('.', 'p')}"
-            "_noisy_GR150R_F150W.png"
+            "_noisy_GR150C_F200W.png"
         )
         plt.savefig(filename)
         plt.close()

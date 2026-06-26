@@ -25,6 +25,8 @@ from jwst.assign_wcs import AssignWcsStep
 
 import stpsf
 
+from astropy.table import vstack
+
 
 from spectrex import (
     EigenspectraBasis,
@@ -43,10 +45,10 @@ IMAGES = HERE / "unittests" / "Images"
 # ── Configuration ─────────────────────────────────────────────────────────────
 # set cold_start true if anything in this configuration section is changed or delete operator chache
 COLD_START = False    # set True to force operator rebuild from scratch
-DIRECT_FULL_ORIGIN = (300,20) # (0,0) of direct image is at DIRECT_FULL_ORIGIN of full size image
-IMAGE_SHAPE = (20, 1400) # Main frame
-DETECTOR_SHAPE = (30,2000) # Direct image shape
-SOURCE_ORIGIN = (5,300) # (0,0) of main frame is at SOURCE_ORIGEIN of Direct image
+DIRECT_FULL_ORIGIN = (1010,300) # (0,0) of direct image is at DIRECT_FULL_ORIGIN of full size image
+IMAGE_SHAPE = (20, 600) # Main frame
+DETECTOR_SHAPE = (30, 1000) # Direct image shape
+SOURCE_ORIGIN = (5, 200) # (0,0) of main frame is at SOURCE_ORIGEIN of Direct image
 N_COMPONENTS = 10     # must match eigenspectra CSV, basis components
 
 
@@ -77,13 +79,36 @@ if OPERATOR_CACHE.exists() and not COLD_START:
     op = SciPySparseOperator.load(OPERATOR_CACHE)
     print(f"Operator loaded from {OPERATOR_CACHE}  "
           f"(shape {op._H.shape[0]} × {op._H.shape[1]})")
+    H_normal = op._H
+    print("Number non zeros normal",H_normal.nnz)
+    H_binary = H_normal.copy()
+    H_binary.data[:] = 1.0
+    # keep only every 10th detector row
+    H_binary = H_binary[:, ::N_COMPONENTS]
+    n_nonzero = H_binary.nnz
+    print("Nonzero entries:", n_nonzero)
+    op_binary = SciPySparseOperator(H_binary, op.image_shape)
+    col_sums = H_binary.sum(axis=0).A1
+    print(f"Binary operator: {op_binary._H.shape}, nnz={op_binary._H.nnz}")
 else:
     t0 = time.perf_counter()
     op = SciPySparseOperator.build_extended(config, basis, IMAGE_SHAPE,DETECTOR_SHAPE,SOURCE_ORIGIN)
     op.save(OPERATOR_CACHE)
+    H_normal = op._H
+    print("Number non zeros normal",H_normal.nnz)
+    H_binary = H_normal.copy()
+    H_binary.data[:] = 1.0
+    # keep only every 10th detector row
+    H_binary = H_binary[:, ::N_COMPONENTS]
+    n_nonzero = H_binary.nnz
+    print("Nonzero entries:", n_nonzero)
+    op_binary = SciPySparseOperator(H_binary, op.image_shape)
+    col_sums = H_binary.sum(axis=0).A1
+    print(f"Binary operator: {op_binary._H.shape}, nnz={op_binary._H.nnz}")
     elapsed = time.perf_counter() - t0
     print(f"Operator built in {elapsed:.1f} s — cached to {OPERATOR_CACHE}")
     print(f"Shape: {op._H.shape[0]} × {op._H.shape[1]}")
+    print("Building process. Nonzeros:", op._H.nnz)
 
 # Helper
 def _clipping(arr, nsigma_lo=2, nsigma_hi=2):
@@ -137,7 +162,9 @@ def estimate_sigma_from_stpsf(
 
     return sigma_detector_pixels, psf
 
-
+def sigma_look_up(filter):
+    "F200W has sigma 1.61.... Create look up table"
+    return
 # -------------------------------------------------------------------------
 # FITS helpers
 # -------------------------------------------------------------------------
@@ -471,37 +498,41 @@ def run_real_scene_optimized_recovery(
     # ---------------------------------------------------------------------
 
     direct = read_fits_image(direct_fits, ext=direct_ext)
+    direct = np.rot90(direct,2)
     dispersed = read_fits_image(dispersed_fits, ext=dispersed_ext)
+    dispersed = np.rot90(dispersed,2)
     vmin_dr, vmax_dr = _clipping(direct)
     vmin_d2, vmax_d2 = _clipping(dispersed)
     plt.figure(figsize=(4, 8))
-    plt.imshow(direct, origin="lower", aspect="auto", cmap="inferno", vmin= vmin_dr, vmax= vmax_dr)
+    plt.imshow(direct, origin="lower", cmap="inferno", vmin= vmin_dr, vmax= vmax_dr)
     plt.title("Original direct image")
     plt.colorbar()
     plt.show()
 
     plt.figure(figsize=(4, 8))
-    plt.imshow(dispersed, origin="lower", aspect="auto", cmap="inferno", vmin= vmin_d2, vmax= vmax_d2)
+    plt.imshow(dispersed, origin="lower",  cmap="inferno", vmin= vmin_d2, vmax= vmax_d2)
     plt.title("Original dispersed image")
     plt.colorbar()
     plt.show()
 
     direct = direct[DIRECT_FULL_ORIGIN[0]:DIRECT_FULL_ORIGIN[0]+direct_stamp_shape[0], DIRECT_FULL_ORIGIN[1]:DIRECT_FULL_ORIGIN[1]+direct_stamp_shape[1]]
-    dispersed = dispersed[DIRECT_FULL_ORIGIN[0]+ SOURCE_ORIGIN[0]:DIRECT_FULL_ORIGIN[0]+SOURCE_ORIGIN[0]+dispersed_stamp_shape[0], DIRECT_FULL_ORIGIN[1]+SOURCE_ORIGIN[1] :DIRECT_FULL_ORIGIN[1]+SOURCE_ORIGIN[1]+dispersed_stamp_shape[1]]
+    dispersed = dispersed[DIRECT_FULL_ORIGIN[0]+ SOURCE_ORIGIN[0]:DIRECT_FULL_ORIGIN[0]+SOURCE_ORIGIN[0]+dispersed_stamp_shape[0], DIRECT_FULL_ORIGIN[1]+SOURCE_ORIGIN[1]  :DIRECT_FULL_ORIGIN[1]+SOURCE_ORIGIN[1]+dispersed_stamp_shape[1]]
     
-    vmin_dr, vmax_dr = _clipping(direct)
-    vmin_d2, vmax_d2 = _clipping(dispersed)
-    plt.figure(figsize=(4, 8))
-    plt.imshow(direct, origin="lower", aspect="auto", cmap="inferno", vmin= vmin_dr, vmax= vmax_dr)
-    plt.title("Original clipped direct image")
-    plt.colorbar()
-    plt.show()
+    # vmin_dr, vmax_dr = _clipping(direct)
+    # vmin_d2, vmax_d2 = _clipping(dispersed)
+    # plt.figure(figsize=(4, 8))
+    # plt.imshow(direct, origin="lower", cmap="inferno", vmin= vmin_dr, vmax= vmax_dr)
+    # plt.title("Original clipped direct image")
+    # plt.colorbar(orientation = "horizontal")
+    # plt.show()
 
-    plt.figure(figsize=(4, 8))
-    plt.imshow(dispersed, origin="lower", aspect="auto", cmap="inferno", vmin= vmin_d2, vmax= vmax_d2)
-    plt.title("Original clipped dispersed image")
-    plt.colorbar()
-    plt.show()
+    # plt.figure(figsize=(4, 8))
+    # plt.imshow(dispersed, origin="lower",  cmap="inferno", vmin= vmin_d2, vmax= vmax_d2)
+    # plt.title("Original clipped dispersed image")
+    # plt.colorbar(orientation = "horizontal")
+    # plt.show()
+    
+    dispersion_of_direct(op_binary,direct)
         
     DETECTOR_SHAPE = direct.shape
     IMAGE_SHAPE = dispersed.shape
@@ -609,6 +640,66 @@ def run_real_scene_optimized_recovery(
 
     if n_src == 0:
         raise ValueError("No catalog sources landed inside the detector.")
+    
+    # ---------------------------------------------------------------------
+    # Build Gaussian-amplitude image
+    # ---------------------------------------------------------------------
+
+    amp_img = np.full(direct.shape, np.nan)
+
+    for s in sources.values():
+
+        pix = np.asarray(s["pixels"], dtype=int)
+        amp = np.asarray(s["amplitudes"], dtype=float)
+
+        yy = pix // W
+        xx = pix % W
+
+        amp_img[yy, xx] = np.maximum(
+            np.nan_to_num(amp_img[yy, xx], nan=0.0),
+            amp,
+        )
+
+    # ---------------------------------------------------------------------
+    # Plot side-by-side with direct image
+    # ---------------------------------------------------------------------
+
+    fig, axes = plt.subplots(
+        2,
+        1,
+        figsize=(5,12),
+        constrained_layout=True,
+    )
+
+    vmin_dr, vmax_dr = _clipping(direct)
+
+    im0 = axes[0].imshow(
+        direct,
+        origin="lower",
+        cmap="inferno",
+        vmin=vmin_dr,
+        vmax=vmax_dr,
+    )
+
+    axes[0].set_title("Direct image")
+    axes[0].set_xlabel("x")
+    axes[0].set_ylabel("y")
+
+    im1 = axes[1].imshow(
+        amp_img,
+        origin="lower",
+        cmap="viridis",
+        interpolation="nearest",
+    )
+
+    axes[1].set_title("Gaussian support amplitudes")
+    axes[1].set_xlabel("x")
+    axes[1].set_ylabel("y")
+
+    fig.colorbar(im0, ax=axes[0], label="Flux", orientation = "horizontal")
+    fig.colorbar(im1, ax=axes[1], label="Amplitude", orientation = "horizontal")
+
+    plt.show()
 
     # ---------------------------------------------------------------------
     # Mixing matrix M
@@ -716,26 +807,26 @@ def run_real_scene_optimized_recovery(
 
         vmin_dr, vmax_dr = _clip(direct)
         vmin_d2, vmax_d2 = _clip(dispersed)
+        vmin_recov, vmax_recov = _clip(recovered_img)
         _, vmax_res_img = _clip(residual_img, lo=1, hi=99)
         _, vmax_res_disp = _clip(residual_dispersion, lo=1, hi=99)
 
         fig, axes = plt.subplots(
-            1,
             4,
-            figsize=(16, 4),
+            1,
+            figsize=(8, 16),
             constrained_layout=True,
         )
 
         kw = dict(
             origin="lower",
-            aspect="auto",
             interpolation="nearest",
             cmap="inferno",
         )
 
         im0 = axes[0].imshow(direct, vmin=vmin_dr, vmax=vmax_dr, **kw)
         im1 = axes[1].imshow(dispersed, vmin=vmin_d2, vmax=vmax_d2, **kw)
-        im2 = axes[2].imshow(recovered_img, vmin=vmin_dr, vmax=vmax_dr, **kw)
+        im2 = axes[2].imshow(recovered_img, vmin=vmin_recov, vmax=vmax_recov, **kw)
         im3 = axes[3].imshow(
             residual_dispersion,
             vmin=0,
@@ -754,7 +845,7 @@ def run_real_scene_optimized_recovery(
             ax.set_title(title)
             ax.set_xlabel("column")
             ax.set_ylabel("row")
-            fig.colorbar(im, ax=ax)
+            fig.colorbar(im, ax=ax,orientation = "horizontal")
 
         fig.suptitle(
             f"Real-data recovery, "
@@ -856,7 +947,7 @@ def add_time_and_position_columns(obs):
     obs["mjd"] = t.mjd
     return obs
 
-
+# download pairs
 def download_pair_from_archivefileid_debug(
     direct_row,
     grism_row,
@@ -897,15 +988,6 @@ def download_pair_from_archivefileid_debug(
         print(p)
 
     return paths[0], paths[1]
-
-from pathlib import Path
-
-import numpy as np
-import astropy.units as u
-
-from astropy.coordinates import SkyCoord
-from astropy.table import vstack
-from astroquery.mast import Observations
 
 
 def download_pair_with_observations(
@@ -1140,6 +1222,69 @@ def find_direct_grism_pairs_debug(
 
     return pairs
 
+# -------------------------------------
+# Debugging
+# -------------------------------------
+def dispersion_of_direct(op_binary,direct):
+    direct_flattened = direct.ravel()# #flattens direct image matrix to vector for matrix multiplication. Ravel=Flatten but faster
+        
+        
+        #divides each entry by amount of trace pixels such that the sum of the trace has the same value as its original object. 
+        #This simulates intensity distribution. Here: Uniform distribution
+    d = np.divide(direct_flattened,col_sums, out=direct_flattened.copy(), where = col_sums !=0) 
+    dispersed_binary = op_binary.apply(d).reshape(IMAGE_SHAPE)
+    vmin_d, vmax_d = _clipping(dispersed_binary)
+    plt.imshow(dispersed_binary, vmin= vmin_d, vmax=vmax_d)
+    plt.colorbar(orientation = "horizontal")
+    plt.show()
+    
+    # #dispersion of mock with big source
+    # #Create empty image: 30 rows, 900 columns
+    # img = np.zeros(DETECTOR_SHAPE)
+
+    # # Place a single bright pixel at row=20, col=720
+    # img[7, 750] = 1
+    # img[6, 750] = 1
+    # img[8, 750] = 1
+    # img[7, 751] = 1
+    # img[7, 749] = 1
+    
+    # img_flattened = img.ravel()
+    # dispersed_mock = op_binary.apply(img_flattened).reshape(IMAGE_SHAPE)
+    # dispersed_mock = np.rot90(dispersed_mock, 2)
+    # plt.subplot(2,1,1)
+    # plt.imshow(img)
+    # plt.subplot(2,1,2)
+    # plt.imshow(dispersed_mock)
+    # plt.show()
+    return dispersed_binary
+    
+i_src, j_src = 10, 1500
+i0 = i_src - SOURCE_ORIGIN[0]
+j0 = j_src - SOURCE_ORIGIN[1]
+
+for order in config.orders:
+    x_trace, y_trace = config.get_trace(float(i0), float(j0), order=order)
+
+    print("order:", order)
+    print("x_trace range:", x_trace.min(), x_trace.max())
+    print("y_trace range:", y_trace.min(), y_trace.max())
+    print("detector_shape:", IMAGE_SHAPE)
+    
+    # current version
+    x1, y1 = config.get_trace(float(i0), float(j0), order=order)
+
+    # swapped input version
+    x2, y2 = config.get_trace(float(j0), float(i0), order=order)
+
+    print("current input:")
+    print("x range:", x1.min(), x1.max())
+    print("y range:", y1.min(), y1.max())
+
+    print("swapped input:")
+    print("x range:", x2.min(), x2.max())
+    print("y range:", y2.min(), y2.max())
+
 print("I run")
 # obs = query_niriss_program(program=3383)
 # obs = add_time_and_position_columns(obs)
@@ -1153,6 +1298,15 @@ print("I run")
 #     max_pair_sep_arcsec=300.0,
 #     max_time_delta_min=360.0,
 #     grism="GR150C",
+# )
+# pairs = sorted(
+#     pairs,
+#     key=lambda p: (
+#         not p[2],   # prefer same_visit=True
+#         p[1],       # smaller angular separation
+#         p[0],       # smaller time difference
+        
+#     ),
 # )
 
 # if len(pairs) == 0:
@@ -1179,7 +1333,7 @@ print("I run")
 # print("dispersed_fits =", dispersed_fits)
 
 direct_fits = HERE / "mast_downloads"/"mastDownload"/"JWST"/"jw03383181001_03201_00002_nis"/"jw03383181001_03201_00002_nis_rate.fits"
-dispersed_fits = HERE/ "mast_downloads"/"mastDownload"/"JWST"/"jw03383182001_05201_00003_nis"/"jw03383182001_05201_00003_nis_rate.fits"
+dispersed_fits = HERE/ "mast_downloads"/"mastDownload"/"JWST"/ "jw03383182001_05201_00003_nis"/"jw03383182001_05201_00003_nis_rate.fits"
 
 result = run_real_scene_optimized_recovery(
     direct_fits=direct_fits,
@@ -1196,7 +1350,7 @@ result = run_real_scene_optimized_recovery(
     noise_factor=3.0,
     min_radius_sigma=0.25,
     max_radius_sigma=6.0,
-    fixed_sigma=1.61,
+    fixed_sigma=1.61, # Note: this is F200W specific. In need of a look up table!!!!
     PLOTS=True,
     direct_stamp_shape=DETECTOR_SHAPE,
     dispersed_stamp_shape=IMAGE_SHAPE,

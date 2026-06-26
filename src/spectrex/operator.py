@@ -275,34 +275,56 @@ class SciPySparseOperator:
                     i0 = i_src - row_offset
                     j0 = j_src - col_offset
                     
-                    try:
-                        x_trace, y_trace = config.get_trace(
-                            float(i0), float(j0), order=order
-                        )
-                    except (ValueError, IndexError) as exc:
-                        logger.debug(
-                            "get_trace failed at (%d, %d), detector-coord (%d, %d), order %s: %s",
-                            i_src, j_src, i0, j0, order, exc,
-                        )
-                        continue
-
-                    x_pix = np.round(x_trace).astype(int)
-                    y_pix = np.round(y_trace).astype(int)
+                    if config.grism[-1]=="R":
+                        
+                    
+                        try: # now x_trace passes rows, y_trace passes columns
+                            x_trace, y_trace = config.get_trace(
+                                float(i0), float(j0), order=order
+                            )
+                        except (ValueError, IndexError) as exc:
+                            logger.debug(
+                                "get_trace failed at (%d, %d), detector-coord (%d, %d), order %s: %s",
+                                i_src, j_src, i0, j0, order, exc,
+                            )
+                            continue
+                        row_trace = x_trace
+                        col_trace = y_trace
+                        
+                    elif config.grism[-1] =="C":
+                        try: # now x_trace passes rows, y_trace passes columns
+                            x_trace, y_trace = config.get_trace(
+                                float(j0), float(i0), order=order
+                            )
+                        except (ValueError, IndexError) as exc:
+                            logger.debug(
+                                "get_trace failed at (%d, %d), detector-coord (%d, %d), order %s: %s",
+                                i_src, j_src, i0, j0, order, exc,
+                            )
+                            continue
+                        row_trace = y_trace
+                        col_trace = x_trace
+                        
+                    else:
+                        logger.debug("Neither GRxxxC nor GRxxxR detected")
+                        
+                    row_pix = np.round(row_trace).astype(int)
+                    col_pix = np.round(col_trace).astype(int)
 
                     # Keep only trace pixels visible in the detector frame m*n
                     mask = (
-                        (x_pix >= 0) & (x_pix < n_rows_det)
-                        & (y_pix >= 0) & (y_pix < n_cols_det)
+                        (row_pix >= 0) & (row_pix < n_rows_det)
+                        & (col_pix >= 0) & (col_pix < n_cols_det)
                     )
                     if not np.any(mask):
                         continue
 
-                    x_valid = x_pix[mask]
-                    y_valid = y_pix[mask]
+                    row_valid = row_pix[mask]
+                    col_valid = col_pix[mask]
                     lam_idx = np.where(mask)[0]
 
                     # Row indices in H for the dispersed pixels
-                    rows_h = x_valid * n_cols_det + y_valid   # (n_valid,)
+                    rows_h = row_valid * n_cols_det + col_valid   # (n_valid,)
                     # Phi values at valid wavelengths: (n_valid, h)
                     phi_valid = Phi[lam_idx, :]
 
@@ -316,9 +338,11 @@ class SciPySparseOperator:
                     row_idx.append(rows_block)
                     col_idx.append(cols_block)
                     data_list.append(data_block)
+                    
+               
 
             logger.debug("Built H contributions for order %s.", order)
-
+            
         if data_list:
             all_rows = np.concatenate(row_idx)
             all_cols = np.concatenate(col_idx)
