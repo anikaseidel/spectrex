@@ -26,6 +26,9 @@ from jwst.assign_wcs import AssignWcsStep
 import stpsf
 
 from astropy.table import vstack
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 from spectrex import (
@@ -504,17 +507,17 @@ def run_real_scene_optimized_recovery(
     dispersed = np.rot90(dispersed,2)
     vmin_dr, vmax_dr = _clipping(direct)
     vmin_d2, vmax_d2 = _clipping(dispersed)
-    plt.figure(figsize=(4, 8))
-    plt.imshow(direct, origin="lower", cmap="inferno", vmin= vmin_dr, vmax= vmax_dr)
-    plt.title("Original direct image")
-    plt.colorbar()
-    plt.show()
+    # plt.figure(figsize=(4, 8))
+    # plt.imshow(direct, origin="lower", cmap="inferno", vmin= vmin_dr, vmax= vmax_dr)
+    # plt.title("Original direct image")
+    # plt.colorbar()
+    # plt.show()
 
-    plt.figure(figsize=(4, 8))
-    plt.imshow(dispersed, origin="lower",  cmap="inferno", vmin= vmin_d2, vmax= vmax_d2)
-    plt.title("Original dispersed image")
-    plt.colorbar()
-    plt.show()
+    # plt.figure(figsize=(4, 8))
+    # plt.imshow(dispersed, origin="lower",  cmap="inferno", vmin= vmin_d2, vmax= vmax_d2)
+    # plt.title("Original dispersed image")
+    # plt.colorbar()
+    # plt.show()
 
     direct = direct[DIRECT_FULL_ORIGIN[0]:DIRECT_FULL_ORIGIN[0]+direct_stamp_shape[0], DIRECT_FULL_ORIGIN[1]:DIRECT_FULL_ORIGIN[1]+direct_stamp_shape[1]]
     dispersed = dispersed[DIRECT_FULL_ORIGIN[0]+ SOURCE_ORIGIN[0]:DIRECT_FULL_ORIGIN[0]+SOURCE_ORIGIN[0]+dispersed_stamp_shape[0], DIRECT_FULL_ORIGIN[1]+SOURCE_ORIGIN[1]  :DIRECT_FULL_ORIGIN[1]+SOURCE_ORIGIN[1]+dispersed_stamp_shape[1]]
@@ -750,7 +753,7 @@ def run_real_scene_optimized_recovery(
     # Recovery
     # ---------------------------------------------------------------------
 
-    solver = SpectralSolver(op, **solver_kwargs)
+    solver = SpectralSolver(op, basis, **solver_kwargs)
 
     # With M, the solver should solve:
     #
@@ -797,14 +800,15 @@ def run_real_scene_optimized_recovery(
     # ---------------------------------------------------------------------
     # Optional plots
     # ---------------------------------------------------------------------
+  
+    
+    def _clip(img, lo=1, hi=99):
+        finite = img[np.isfinite(img)]
+        if finite.size == 0:
+            return 0.0, 1.0
+        return np.percentile(finite, lo), np.percentile(finite, hi)
 
     if PLOTS:
-
-        def _clip(img, lo=1, hi=99):
-            finite = img[np.isfinite(img)]
-            if finite.size == 0:
-                return 0.0, 1.0
-            return np.percentile(finite, lo), np.percentile(finite, hi)
 
         vmin_dr, vmax_dr = _clip(direct)
         vmin_d2, vmax_d2 = _clip(dispersed)
@@ -866,6 +870,60 @@ def run_real_scene_optimized_recovery(
             
         else:
             plt.show()
+            
+        # ---------------- Normalization
+        direct = normalization(direct)
+        recovered_img = normalization(recovered_img)
+        
+        vmin_dr, vmax_dr = _clip(direct)
+        vmin_rec, vmax_rec = _clip(recovered_img)
+
+        fig, axes = plt.subplots(
+            2,
+            1,
+            constrained_layout=True,
+        )
+
+        kw = dict(
+            origin="lower",
+            interpolation="nearest",
+            cmap="inferno",
+        )
+
+        im0 = axes[0].imshow(direct, vmin = vmin_dr, vmax = vmax_dr, **kw)
+        im1 = axes[1].imshow(recovered_img,  vmin = vmin_rec, vmax = vmax_rec, **kw)
+        
+        titles = [
+            "Normalized Direct image",
+            "Normalized Recovered direct image",
+        ]
+
+        for ax, im, title in zip(axes, [im0, im1], titles):
+            ax.set_title(title)
+            ax.set_xlabel("column")
+            ax.set_ylabel("row")
+            fig.colorbar(im, ax=ax,orientation = "horizontal")
+
+        fig.suptitle(
+            f"Real-data recovery, "
+            f"n_src={n_src}, "
+            f"pd={pixel_density:.4f}%, "
+            f"sigma={sigma:.3f}"
+        )
+        if Save == True:
+            outdir = Path("unittests/Images")
+            outdir.mkdir(parents=True, exist_ok=True)
+            fig.savefig(
+                outdir / f"recovery_normalized_{n_src}_{sigma:.2f}.png",
+                dpi=300,
+                bbox_inches="tight",
+            )
+            plt.close(fig)
+            
+        else:
+            plt.show()
+        
+        # ------------------------------ Gaussian support
 
         fig, ax = plt.subplots(figsize=(5, 5), constrained_layout=True)
         ax.imshow(direct, vmin=vmin_dr, vmax=vmax_dr, **kw)
@@ -887,6 +945,8 @@ def run_real_scene_optimized_recovery(
         ax.set_xlabel("column")
         ax.set_ylabel("row")
         if Save == True:
+            outdir = Path("unittests/Images")
+            outdir.mkdir(parents=True, exist_ok=True)
             fig.savefig(
                 outdir / f"source_supports_{n_src}_{sigma:.2f}.png",
                 dpi=300,
@@ -896,7 +956,23 @@ def run_real_scene_optimized_recovery(
             
         else:
             plt.show()
+            
+        # ---------------- H*recov
 
+        dispersion_of_recovered(op,recovered,n_src, sigma, Save)   # H*recov
+        
+              
+        # ------------ Coefficient distributions
+        
+        coefficient_distribution(recovered)       
+        
+        # ------------ Sample spectra
+        display_spectra(recovered, 5, n_src, sigma, Save)
+   
+        
+    
+    
+    
     # ---------------------------------------------------------------------
     # Return
     # ---------------------------------------------------------------------
@@ -1245,6 +1321,26 @@ def find_direct_grism_pairs_debug(
 # -------------------------------------
 # Debugging
 # -------------------------------------
+def dispersion_of_recovered(op,recovered,n_src, sigma, Save=None):
+    dispersed_recovered = op.apply(recovered).reshape(IMAGE_SHAPE)
+    vmin_d, vmax_d = _clipping(dispersed_recovered)
+    plt.imshow(dispersed_recovered, vmin= vmin_d, vmax=vmax_d)
+    plt.title("H*recovered, Dispersed recovered")
+    plt.colorbar(orientation = "horizontal")
+    if Save == True:
+        outdir = Path("unittests/Images")
+        outdir.mkdir(parents=True, exist_ok=True)
+        plt.savefig(
+            outdir / f"source_dispersion_of_recovered_{n_src}_{sigma:.2f}.png",
+            dpi=300,
+            bbox_inches="tight",
+        )
+        plt.close()
+        
+    else:
+        plt.show()
+    return
+    
 def dispersion_of_direct(op_binary,direct):
     direct_flattened = direct.ravel()# #flattens direct image matrix to vector for matrix multiplication. Ravel=Flatten but faster
         
@@ -1279,78 +1375,144 @@ def dispersion_of_direct(op_binary,direct):
     # plt.show()
     return dispersed_binary
     
-i_src, j_src = 10, 1500
-i0 = i_src - SOURCE_ORIGIN[0]
-j0 = j_src - SOURCE_ORIGIN[1]
+def coefficient_distribution(a_tilde):
+    """Computes some debugging values for the coefficients. Does it for all a_i at once."""
+    if len(a_tilde) % N_COMPONENTS != 0:
+        print("Wrong vector shape", len(a_tilde))
+        logger.debug("Wrong vector shape", a_tilde.shape)
+    else:
+        print("Wrong vector shape", len(a_tilde))
+        X = a_tilde.reshape(-1,N_COMPONENTS) # a_1 all in a column, a_2,...a_k as well. So means can be computed columnwise
+        maximum = X.max(axis=0)
+        minimum = X.min(axis=0)
+        mean = X.mean(axis = 0)
+        
+        for i in range(N_COMPONENTS):
+        
+            print(f"a_{i}: Mean = {mean[i]}, Minimum = {minimum[i]}, Maximum = {maximum[i]}")
+    return
 
-for order in config.orders:
-    x_trace, y_trace = config.get_trace(float(i0), float(j0), order=order)
-
-    print("order:", order)
-    print("x_trace range:", x_trace.min(), x_trace.max())
-    print("y_trace range:", y_trace.min(), y_trace.max())
-    print("detector_shape:", IMAGE_SHAPE)
+def display_spectra(a_tilde, k, n_src, sigma, Save = None):
+    X = a_tilde.reshape(-1,N_COMPONENTS)
+    nonzero_blocks = np.any(X !=0, axis =1)
+    nonzero_indices = np.flatnonzero(nonzero_blocks)
+    for i in range(k):
+        i = i*20
+        ith_block = X[nonzero_indices[i]]
+        
+        f_lambda = basis.reconstruct(ith_block) # flux per wavelength
+        n_wavelength = f_lambda.shape # (150,)
+     
+        wavelengths = np.linspace(config.wavelengths[0],config.wavelengths[-1], n_wavelength[0])  #wavelength list
+        
+        plt.figure()
+        plt.plot(wavelengths, f_lambda)
+        plt.xlabel("Wavelength (Angstrom)")
+        plt.ylabel("Flux")
+        plt.title(f"Example spectrum {i}/k")
+             
+        if Save == True:
+            outdir = Path("unittests/Images")
+            outdir.mkdir(parents=True, exist_ok=True)
+            plt.savefig(
+                outdir / f"sample_spectrum{i}_{n_src}_{sigma:.2f}.png",
+                dpi=300,
+                bbox_inches="tight",
+            )
+            plt.close()
+            
+        else:
+            plt.show()
+     
+    return
+        
+def normalization(img):
+        min = np.min(img)
+        max = np.max(img)
+        print("Normalization:")
+        print(f"Maximum {max}, minimum {min}")
+        return (img-min)/(max-min)
     
-    # current version
-    x1, y1 = config.get_trace(float(i0), float(j0), order=order)
+# ------------------------------ Debugging grismagic
+# i_src, j_src = 10, 1500
+# i0 = i_src - SOURCE_ORIGIN[0]
+# j0 = j_src - SOURCE_ORIGIN[1]
 
-    # swapped input version
-    x2, y2 = config.get_trace(float(j0), float(i0), order=order)
+# for order in config.orders:
+#     x_trace, y_trace = config.get_trace(float(i0), float(j0), order=order)
 
-    print("current input:")
-    print("x range:", x1.min(), x1.max())
-    print("y range:", y1.min(), y1.max())
+#     print("order:", order)
+#     print("x_trace range:", x_trace.min(), x_trace.max())
+#     print("y_trace range:", y_trace.min(), y_trace.max())
+#     print("detector_shape:", IMAGE_SHAPE)
+    
+#     # current version
+#     x1, y1 = config.get_trace(float(i0), float(j0), order=order)
 
-    print("swapped input:")
-    print("x range:", x2.min(), x2.max())
-    print("y range:", y2.min(), y2.max())
+#     # swapped input version
+#     x2, y2 = config.get_trace(float(j0), float(i0), order=order)
 
-print("I run")
-obs = query_niriss_program(program=3383)
-obs = add_time_and_position_columns(obs)
-#print(obs.colnames)
+#     print("current input:")
+#     print("x range:", x1.min(), x1.max())
+#     print("y range:", y1.min(), y1.max())
 
-pairs = find_direct_grism_pairs_debug(
-    obs,
-    target_ra=23.35,
-    target_dec=30.49,
-    max_target_sep_arcsec=300.0,
-    max_pair_sep_arcsec=300.0,
-    max_time_delta_min=360.0,
-    grism="GR150C",
-)
-pairs = sorted(
-    pairs,
-    key=lambda p: (
-        not p[2],   # prefer same_visit=True
-        p[1],       # smaller angular separation
-        p[0],       # smaller time difference
+#     print("swapped input:")
+#     print("x range:", x2.min(), x2.max())
+#     print("y range:", y2.min(), y2.max())
+
+# -----------------------------------------------------------------
+# ------------- Download matching image pairs ---------------------
+# -----------------------------------------------------------------
+
+# obs = query_niriss_program(program=3383)
+# obs = add_time_and_position_columns(obs)
+# #print(obs.colnames)
+
+# pairs = find_direct_grism_pairs_debug(
+#     obs,
+#     target_ra=23.35,
+#     target_dec=30.49,
+#     max_target_sep_arcsec=300.0,
+#     max_pair_sep_arcsec=300.0,
+#     max_time_delta_min=360.0,
+#     grism="GR150C",
+# )
+# pairs = sorted(
+#     pairs,
+#     key=lambda p: (
+#         not p[2],   # prefer same_visit=True
+#         p[1],       # smaller angular separation
+#         p[0],       # smaller time difference
         
-    ),
-)
+#     ),
+# )
 
-if len(pairs) == 0:
-    print("No pairs.")
-else:
-    for dt_min, sep_arcsec, same_visit, direct, grism in pairs:
-        print("\nPAIR")
-        print("dt [min]      =", dt_min)
-        print("sep [arcsec]  =", sep_arcsec)
-        print("same visit    =", same_visit)
-        print("direct:", direct["ArchiveFileID"], direct["exp_type"], direct["filter"], direct["niriss_pupil"])
-        print("grism: ", grism["ArchiveFileID"], grism["exp_type"], grism["filter"], grism["niriss_pupil"])
+# if len(pairs) == 0:
+#     print("No pairs.")
+# else:
+#     for dt_min, sep_arcsec, same_visit, direct, grism in pairs:
+#         print("\nPAIR")
+#         print("dt [min]      =", dt_min)
+#         print("sep [arcsec]  =", sep_arcsec)
+#         print("same visit    =", same_visit)
+#         print("direct:", direct["ArchiveFileID"], direct["exp_type"], direct["filter"], direct["niriss_pupil"])
+#         print("grism: ", grism["ArchiveFileID"], grism["exp_type"], grism["filter"], grism["niriss_pupil"])
         
-dt_min, sep_arcsec, same_visit, direct_row, grism_row = pairs[0]
+# dt_min, sep_arcsec, same_visit, direct_row, grism_row = pairs[0]
 
-direct_fits, dispersed_fits = download_pair_with_observations(
-    direct_row,
-    grism_row,
-    download_dir="mast_downloads",
-    prefer_suffix="_rate.fits",
-)
+# direct_fits, dispersed_fits = download_pair_with_observations(
+#     direct_row,
+#     grism_row,
+#     download_dir="mast_downloads",
+#     prefer_suffix="_rate.fits",
+# )
 
-print("direct_fits    =", direct_fits)
-print("dispersed_fits =", dispersed_fits)
+# print("direct_fits    =", direct_fits)
+# print("dispersed_fits =", dispersed_fits)
+
+# -----------------------------------------------------------------
+# -------------------- Running pipeline ---------------------------
+# -----------------------------------------------------------------
 
 direct_fits = HERE / "mast_downloads"/"mastDownload"/"JWST"/"jw03383181001_03201_00002_nis"/"jw03383181001_03201_00002_nis_rate.fits"
 dispersed_fits = HERE/ "mast_downloads"/"mastDownload"/"JWST"/ "jw03383182001_05201_00003_nis"/"jw03383182001_05201_00003_nis_rate.fits"
