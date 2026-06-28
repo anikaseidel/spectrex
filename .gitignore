@@ -51,8 +51,11 @@ spectrex_neurips_2026_paper
 .pixi/*
 !.pixi/config.toml
 
-# testdata, images
-testdata/RateFiles/*
+# images
 mast_downloads/*
+
+# operator
 *.npz
+
+# results
 unittests/Images/*
